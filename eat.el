@@ -6086,6 +6086,21 @@ EVENT is the mouse event."
   "Minor mode for mouse movement keymap."
   :interactive nil)
 
+(defun eat--ensure-cursor-visible ()
+  "Make cursor visible if the terminal has hidden it.
+When the terminal sets the cursor to invisible, Emacs modes like
+Emacs mode and Line mode become hard to use.  This forces a visible
+cursor for those modes."
+  (when (and eat-terminal
+             (eq (eat-term-cursor-type eat-terminal) :invisible))
+    (setq-local cursor-type (car eat-default-cursor-type))))
+
+(defun eat--restore-terminal-cursor ()
+  "Restore cursor to the terminal's current state.
+Used when returning to semi-char or char mode."
+  (when eat-terminal
+    (eat--set-cursor nil (eat-term-cursor-type eat-terminal))))
+
 (defun eat-emacs-mode ()
   "Switch to Emacs keybindings mode."
   (interactive)
@@ -6093,6 +6108,7 @@ EVENT is the mouse event."
   (eat--semi-char-mode -1)
   (eat--char-mode -1)
   (setq buffer-read-only t)
+  (eat--ensure-cursor-visible)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
   (force-mode-line-update))
 
@@ -6105,6 +6121,7 @@ EVENT is the mouse event."
   (eat--line-mode-exit)
   (eat--char-mode -1)
   (eat--semi-char-mode +1)
+  (eat--restore-terminal-cursor)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
   (force-mode-line-update))
 
@@ -6117,6 +6134,7 @@ EVENT is the mouse event."
   (eat--line-mode-exit)
   (eat--semi-char-mode -1)
   (eat--char-mode +1)
+  (eat--restore-terminal-cursor)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
   (force-mode-line-update))
 
@@ -6197,6 +6215,7 @@ MODE should one of:
   (eat--char-mode -1)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
   (setq buffer-read-only nil)
+  (eat--ensure-cursor-visible)
   ;; Delete the undo list so that `undo' doesn't mess up with the
   ;; terminal.
   (setq buffer-undo-list nil)
