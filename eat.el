@@ -654,6 +654,15 @@ responsive."
   :group 'eat-ui
   :group 'eat-eshell)
 
+(defcustom eat-synchronized-output-timeout 5.0
+  "Safety timeout for synchronized output in seconds.
+If an application enables synchronized output (mode 2026)
+but fails to disable it within this duration, pending output
+is rendered anyway to prevent display freeze."
+  :type 'number
+  :group 'eat-ui
+  :group 'eat-eshell)
+
 (defcustom eat-term-name #'eat-term-get-suitable-term-name
   "Value for the `TERM' environment variable.
 
@@ -1187,6 +1196,7 @@ Nil when not in alternative display mode.")
   (mouse-pressed nil :documentation "Pressed mouse buttons.")
   (mouse-encoding nil :documentation "Current mouse event encoding.")
   (focus-event-mode nil :documentation "Whether to send focus event.")
+  (synchronized-output nil :documentation "State of synchronized output mode.")
   (cut-buffers
    (1value (make-vector 8 nil))
    :documentation "Cut buffers.")
@@ -1299,6 +1309,7 @@ Don't `set' it, bind it to a value with `let'.")
     (setf (eat--t-term-mouse-mode eat--t-term) nil)
     (setf (eat--t-term-mouse-encoding eat--t-term) nil)
     (setf (eat--t-term-focus-event-mode eat--t-term) nil)
+    (setf (eat--t-term-synchronized-output eat--t-term) nil)
     (setf (eat--t-term-sixel-scroll-mode eat--t-term) t)
     ;; Clear everything.
     (delete-region (point-min) (point-max))
@@ -2215,6 +2226,23 @@ STATE one of the `:invisible', `:block', `:blinking-block',
 (defun eat--t-disable-bracketed-yank ()
   "Disable bracketed yank mode."
   (setf (eat--t-term-bracketed-yank eat--t-term) nil))
+
+(defvar eat--t-last-sync-transition)
+
+(defun eat--t-enable-synchronized-output (action-count)
+  "Enable synchronized output mode.
+ACTION-COUNT is the current parser action count, used to record
+the transition index for sync-aware flushing."
+  (unless (eat--t-term-synchronized-output eat--t-term)
+    (setf (eat--t-term-synchronized-output eat--t-term) t)
+    (setq eat--t-last-sync-transition action-count)))
+
+(defun eat--t-disable-synchronized-output (action-count)
+  "Disable synchronized output mode.
+Always records a transition to trigger a flush, even if already
+disabled.  ACTION-COUNT is the current parser action count."
+  (setf (eat--t-term-synchronized-output eat--t-term) nil)
+  (setq eat--t-last-sync-transition action-count))
 
 (defun eat--t-enable-alt-disp ()
   "Enable alternative display."
@@ -3261,6 +3289,17 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
   "Disable Sixel scrolling mode."
   (setf (eat--t-term-sixel-scroll-mode eat--t-term) nil))
 
+(defun eat--t-sixel-set-current-color (color)
+  "Set current Sixel color register to COLOR."
+  (setf (eat--t-term-sixel-color eat--t-term) color))
+
+(defun eat--t-sixel-carriage-return ()
+  "Reset Sixel cursor X position to 0."
+  (setf (eat--t-cur-sixel-x
+         (eat--t-disp-cursor
+          (eat--t-term-display eat--t-term)))
+        0))
+
 (defun eat--t-ui-cmd (cmd)
   "Call UI's UIC handler to handle CMD."
   (funcall (eat--t-term-ui-cmd-fn eat--t-term) eat--t-term cmd))
@@ -3343,9 +3382,83 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
          ('(2004)
           (eat--t-disable-bracketed-yank)))))))
 
-(defun eat--t-handle-output (output)
-  "Parse and evaluate OUTPUT."
-  (let ((index 0))
+(defun eat--t-dispatch-actions (actions)
+  "Execute parsed ACTIONS on the terminal."
+  (dolist (action actions)
+    (pcase (aref action 0)
+      ;; Text and basic control.
+      ('write (eat--t-write (aref action 1) (aref action 2)
+                            (aref action 3)))
+      ('bell (eat--t-bell))
+      ('cur-left (eat--t-cur-left (aref action 1)))
+      ('horizontal-tab (eat--t-horizontal-tab (aref action 1)))
+      ('line-feed (eat--t-line-feed))
+      ('index (eat--t-index))
+      ('form-feed (eat--t-form-feed))
+      ('carriage-return (eat--t-carriage-return))
+      ('change-charset (eat--t-change-charset (aref action 1)))
+      ;; ESC sequences.
+      ('save-cur (eat--t-save-cur))
+      ('restore-cur (eat--t-restore-cur))
+      ('reverse-index (eat--t-reverse-index))
+      ('reset (eat--t-reset))
+      ;; CSI sequences.
+      ('insert-char (eat--t-insert-char (aref action 1)))
+      ('cur-up (eat--t-cur-up (aref action 1)))
+      ('cur-down (eat--t-cur-down (aref action 1)))
+      ('cur-right (eat--t-cur-right (aref action 1)))
+      ('beg-of-prev-line (eat--t-beg-of-prev-line (aref action 1)))
+      ('beg-of-next-line (eat--t-beg-of-next-line (aref action 1)))
+      ('cur-horizontal-abs (eat--t-cur-horizontal-abs (aref action 1)))
+      ('goto (eat--t-goto (aref action 1) (aref action 2)))
+      ('erase-in-disp (eat--t-erase-in-disp (aref action 1)))
+      ('erase-in-line (eat--t-erase-in-line (aref action 1)))
+      ('insert-line (eat--t-insert-line (aref action 1)))
+      ('delete-line (eat--t-delete-line (aref action 1)))
+      ('delete-char (eat--t-delete-char (aref action 1)))
+      ('scroll-up (eat--t-scroll-up (aref action 1)))
+      ('scroll-down (eat--t-scroll-down (aref action 1)))
+      ('erase-char (eat--t-erase-char (aref action 1)))
+      ('horizontal-backtab (eat--t-horizontal-backtab (aref action 1)))
+      ('repeat-last-char (eat--t-repeat-last-char (aref action 1)))
+      ('send-device-attrs (eat--t-send-device-attrs (aref action 1)
+                                                     (aref action 2)))
+      ('cur-vertical-abs (eat--t-cur-vertical-abs (aref action 1)))
+      ('set-modes (eat--t-set-modes (aref action 1) (aref action 2)))
+      ('reset-modes (eat--t-reset-modes (aref action 1) (aref action 2)))
+      ('set-sgr-params (eat--t-set-sgr-params (aref action 1)))
+      ('device-status-report (eat--t-device-status-report (aref action 1)))
+      ('set-cursor-style (eat--t-set-cursor-style (aref action 1)))
+      ('change-scroll-region (eat--t-change-scroll-region (aref action 1)
+                                                           (aref action 2)))
+      ('send-graphics-attrs (eat--t-send-graphics-attrs (aref action 1)
+                                                         (aref action 2)))
+      ;; OSC sequences.
+      ('set-title (eat--t-set-title (aref action 1)))
+      ('set-cwd (eat--t-set-cwd (aref action 1)))
+      ('report-foreground-color (eat--t-report-foreground-color))
+      ('report-background-color (eat--t-report-background-color))
+      ('ui-cmd (eat--t-ui-cmd (aref action 1)))
+      ('manipulate-selection (eat--t-manipulate-selection (aref action 1)
+                                                          (aref action 2)))
+      ;; Sixel.
+      ('sixel-init (eat--t-sixel-init))
+      ('sixel-write (eat--t-sixel-write (aref action 1) (aref action 2)
+                                         (aref action 3) (aref action 4)))
+      ('sixel-newline (eat--t-sixel-newline))
+      ('sixel-set-color-reg (eat--t-sixel-set-color-reg (aref action 1)
+                                                          (aref action 2)))
+      ('sixel-set-color (eat--t-sixel-set-current-color (aref action 1)))
+      ('sixel-cursor-x-reset (eat--t-sixel-carriage-return))
+      ('sixel-cleanup (eat--t-sixel-cleanup))
+      ;; Charset.
+      ('set-charset (eat--t-set-charset (aref action 1) (aref action 2))))))
+
+(defun eat--t-parse-output (output)
+  "Parse OUTPUT into a list of action vectors."
+  (let ((index 0)
+        (actions nil)
+        (action-count 0))
     (while (/= index (length output))
       (pcase-exhaustive (eat--t-term-parser-state eat--t-term)
         ('nil
@@ -3357,34 +3470,44 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
              (cl-incf index))
            (when (/= ins-beg index)
              ;; Insert.
-             (eat--t-write output ins-beg index))
+             (push (vector 'write output ins-beg index) actions)
+             (cl-incf action-count))
            (when (/= index (length output))
              ;; Dispatch control sequence.
              (cl-incf index)
              (pcase (aref output (1- index))
                (?\a
-                (eat--t-bell))
+                (push (vector 'bell) actions)
+                (cl-incf action-count))
                (?\b
-                (eat--t-cur-left 1))
+                (push (vector 'cur-left 1) actions)
+                (cl-incf action-count))
                (?\t
-                (eat--t-horizontal-tab 1))
+                (push (vector 'horizontal-tab 1) actions)
+                (cl-incf action-count))
                (?\n
-                (eat--t-line-feed))
+                (push (vector 'line-feed) actions)
+                (cl-incf action-count))
                (?\v
-                (eat--t-index))
+                (push (vector 'index) actions)
+                (cl-incf action-count))
                (?\f
-                (eat--t-form-feed))
+                (push (vector 'form-feed) actions)
+                (cl-incf action-count))
                (?\r
                 ;; Avoid going to line home just before a line feed,
                 ;; we can just insert a new line if we are at the
                 ;; end of display.
                 (unless (and (/= index (length output))
                              (= (aref output index) ?\n))
-                  (eat--t-carriage-return)))
+                  (push (vector 'carriage-return) actions)
+                  (cl-incf action-count)))
                (?\C-n
-                (eat--t-change-charset 'g1))
+                (push (vector 'change-charset 'g1) actions)
+                (cl-incf action-count))
                (?\C-o
-                (eat--t-change-charset 'g0))
+                (push (vector 'change-charset 'g0) actions)
+                (cl-incf action-count))
                (?\e
                 (1value (setf (eat--t-term-parser-state eat--t-term)
                               '(read-esc))))
@@ -3426,19 +3549,24 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                     '(read-charset-vt300 g3 "")))
              ;; ESC 7.
              (?7
-              (eat--t-save-cur))
+              (push (vector 'save-cur) actions)
+              (cl-incf action-count))
              ;; ESC 8.
              (?8
-              (eat--t-restore-cur))
+              (push (vector 'restore-cur) actions)
+              (cl-incf action-count))
              ;; ESC D.
              (?D
-              (eat--t-index))
+              (push (vector 'index) actions)
+              (cl-incf action-count))
              ;; ESC E.
              (?E
-              (eat--t-line-feed))
+              (push (vector 'line-feed) actions)
+              (cl-incf action-count))
              ;; ESC M.
              (?M
-              (eat--t-reverse-index))
+              (push (vector 'reverse-index) actions)
+              (cl-incf action-count))
              ;; ESC P, or DCS.
              (?P
               (1value (setf (eat--t-term-parser-state eat--t-term)
@@ -3466,13 +3594,16 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                             '(read-apc ""))))
              ;; ESC c.
              (?c
-              (eat--t-reset))
+              (push (vector 'reset) actions)
+              (cl-incf action-count))
              ;; ESC n.
              (?n
-              (eat--t-change-charset 'g2))
+              (push (vector 'change-charset 'g2) actions)
+              (cl-incf action-count))
              ;; ESC o.
              (?o
-              (eat--t-change-charset 'g3)))))
+              (push (vector 'change-charset 'g3) actions)
+              (cl-incf action-count)))))
         ('(read-csi-format)
          (let ((format nil))
            (pcase (aref output index)
@@ -3539,81 +3670,104 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                (pcase (list function format params)
                  ;; CSI <n> @.
                  (`((?@) nil ((,n)))
-                  (eat--t-insert-char n))
+                  (push (vector 'insert-char n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> A.
                  ;; CSI <n> k.
                  (`((,(or ?A ?k)) nil ((,n)))
-                  (eat--t-cur-up n))
+                  (push (vector 'cur-up n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> B.
                  ;; CSI <n> e.
                  (`((,(or ?B ?e)) nil ((,n)))
-                  (eat--t-cur-down n))
+                  (push (vector 'cur-down n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> C.
                  ;; CSI <n> a.
                  (`((,(or ?C ?a)) nil ((,n)))
-                  (eat--t-cur-right n))
+                  (push (vector 'cur-right n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> D.
                  ;; CSI <n> j.
                  (`((,(or ?D ?j)) nil ((,n)))
-                  (eat--t-cur-left n))
+                  (push (vector 'cur-left n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> E.
                  (`((?E) nil ((,n)))
-                  (eat--t-beg-of-prev-line n))
+                  (push (vector 'beg-of-prev-line n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> F.
                  (`((?F) nil ((,n)))
-                  (eat--t-beg-of-next-line n))
+                  (push (vector 'beg-of-next-line n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> G.
                  ;; CSI <n> `.
                  (`((,(or ?G ?`)) nil ((,n)))
-                  (eat--t-cur-horizontal-abs n))
+                  (push (vector 'cur-horizontal-abs n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> ; <m> H
                  ;; CSI <n> ; <m> f
                  (`((,(or ?H ?f)) nil ,(and (pred listp) params))
-                  (eat--t-goto (caadr params) (caar params)))
+                  (push (vector 'goto (caadr params) (caar params)) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> I.
                  (`((?I) nil ((,n)))
-                  (eat--t-horizontal-tab n))
+                  (push (vector 'horizontal-tab n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> J.
                  (`((?J) nil ((,n)))
-                  (eat--t-erase-in-disp n))
+                  (push (vector 'erase-in-disp n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> K.
                  (`((?K) nil ((,n)))
-                  (eat--t-erase-in-line n))
+                  (push (vector 'erase-in-line n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> L.
                  (`((?L) nil ((,n)))
-                  (eat--t-insert-line n))
+                  (push (vector 'insert-line n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> M.
                  (`((?M) nil ((,n)))
-                  (eat--t-delete-line n))
+                  (push (vector 'delete-line n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> P.
                  (`((?P) nil ((,n)))
-                  (eat--t-delete-char n))
+                  (push (vector 'delete-char n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> S.
                  (`((?S) nil ((,n)))
-                  (eat--t-scroll-up n))
+                  (push (vector 'scroll-up n) actions)
+                  (cl-incf action-count))
                  ;; CSI ? <n> ; <m> ; ... S.
                  (`((?S) ?? ,(or `((,_) (,operation) (,attr))
                                  `((,_) (,_) (,operation) (,attr))))
-                  (eat--t-send-graphics-attrs attr operation))
+                  (push (vector 'send-graphics-attrs attr operation) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> T.
                  (`((?T) nil ((,n)))
-                  (eat--t-scroll-down n))
+                  (push (vector 'scroll-down n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> X.
                  (`((?X) nil ((,n)))
-                  (eat--t-erase-char n))
+                  (push (vector 'erase-char n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> Z.
                  (`((?Z) nil ((,n)))
-                  (eat--t-horizontal-backtab n))
+                  (push (vector 'horizontal-backtab n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> b.
                  (`((?b) nil ((,n)))
-                  (eat--t-repeat-last-char n))
+                  (push (vector 'repeat-last-char n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> c.
                  ;; CSI > <n> c.
                  (`((?c) ,format ((,n)))
-                  (eat--t-send-device-attrs n format))
+                  (push (vector 'send-device-attrs n format) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> d.
                  (`((?d) nil ((,n)))
-                  (eat--t-cur-vertical-abs n))
+                  (push (vector 'cur-vertical-abs n) actions)
+                  (cl-incf action-count))
                  ;; CSI ... h.
                  ;; CSI ? ... h.
                  (`((?h) ,format ,(and (pred listp) params))
@@ -3624,7 +3778,15 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                     (while p
                       (setf (car p) (nreverse (car p)))
                       (setq p (cdr p))))
-                  (eat--t-set-modes params format))
+                  ;; Handle mode 2026 (synchronized output)
+                  ;; directly during parsing.
+                  (when (and (eq format ??)
+                             (member '(2026) params))
+                    (eat--t-enable-synchronized-output action-count)
+                    (setq params (delete '(2026) params)))
+                  (when params
+                    (push (vector 'set-modes params format) actions)
+                    (cl-incf action-count)))
                  ;; CSI ... l.
                  ;; CSI ? ... l.
                  (`((?l) ,format ,(and (pred listp) params))
@@ -3635,7 +3797,15 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                     (while p
                       (setf (car p) (nreverse (car p)))
                       (setq p (cdr p))))
-                  (eat--t-reset-modes params format))
+                  ;; Handle mode 2026 (synchronized output)
+                  ;; directly during parsing.
+                  (when (and (eq format ??)
+                             (member '(2026) params))
+                    (eat--t-disable-synchronized-output action-count)
+                    (setq params (delete '(2026) params)))
+                  (when params
+                    (push (vector 'reset-modes params format) actions)
+                    (cl-incf action-count)))
                  ;; CSI ... m.
                  (`((?m) nil ,(and (pred listp) params))
                   ;; Reverse `params' to get it into the correct
@@ -3645,23 +3815,29 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                     (while p
                       (setf (car p) (nreverse (car p)))
                       (setq p (cdr p))))
-                  (eat--t-set-sgr-params params))
+                  (push (vector 'set-sgr-params params) actions)
+                  (cl-incf action-count))
                  ;; CSI 6 n.
                  (`((?n) nil ((,n)))
-                  (eat--t-device-status-report n))
+                  (push (vector 'device-status-report n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> SP q.
                  (`((?q ?\ ) nil ((,n)))
-                  (eat--t-set-cursor-style n))
+                  (push (vector 'set-cursor-style n) actions)
+                  (cl-incf action-count))
                  ;; CSI <n> ; <n> r.
                  (`((?r) nil ,(and (pred listp) params))
-                  (eat--t-change-scroll-region (caadr params)
-                                               (caar params)))
+                  (push (vector 'change-scroll-region (caadr params)
+                                (caar params)) actions)
+                  (cl-incf action-count))
                  ;; CSI s.
                  (`((?s) nil nil)
-                  (eat--t-save-cur))
+                  (push (vector 'save-cur) actions)
+                  (cl-incf action-count))
                  ;; CSI u.
                  (`((?u) nil nil)
-                  (eat--t-restore-cur)))))))
+                  (push (vector 'restore-cur) actions)
+                  (cl-incf action-count)))))))
         (`(,(and (or 'read-sos 'read-osc 'read-pm 'read-apc) state)
            ,buf)
          ;; Find the end of string.
@@ -3703,31 +3879,37 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                       ((rx string-start (or ?0 ?2) ?\;
                            (let title (zero-or-more anything))
                            string-end)
-                       (eat--t-set-title title))
+                       (push (vector 'set-title title) actions)
+                       (cl-incf action-count))
                       ;; OSC 7 ; <t> ST.
                       ((rx string-start ?7 ?\;
                            (let url (zero-or-more anything))
                            string-end)
-                       (eat--t-set-cwd url))
+                       (push (vector 'set-cwd url) actions)
+                       (cl-incf action-count))
                       ;; OSC 1 0 ; ? ST.
                       ("10;?"
-                       (eat--t-report-foreground-color))
+                       (push (vector 'report-foreground-color) actions)
+                       (cl-incf action-count))
                       ;; OSC 1 1 ; ? ST.
                       ("11;?"
-                       (eat--t-report-background-color))
+                       (push (vector 'report-background-color) actions)
+                       (cl-incf action-count))
                       ;; OSC 5 1 ; <s> ST.
                       ((rx string-start "51;"
                            (let cmd (zero-or-more anything))
                            string-end)
-                       (eat--t-ui-cmd cmd))
+                       (push (vector 'ui-cmd cmd) actions)
+                       (cl-incf action-count))
                       ;; OSC 5 2 ; <t> ; <s> ST.
                       ((rx string-start "52;"
                            (let targets
                              (zero-or-more (not (any ?\;))))
                            ?\; (let data (zero-or-more anything))
                            string-end)
-                       (eat--t-manipulate-selection
-                        targets data))))))))))
+                       (push (vector 'manipulate-selection
+                                     targets data) actions)
+                       (cl-incf action-count))))))))))
         (`(read-dcs-params ,next-state ,params)
          ;; There is no standard format of device control strings, but
          ;; all DEC and XTerm DCS sequences (including those we
@@ -3787,20 +3969,23 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
          (when cmd
            (pcase cmd
              ('init
-              (eat--t-sixel-init))
+              (push (vector 'sixel-init) actions)
+              (cl-incf action-count))
              ('set-color
               (when (and (= (length params) 1)
                          (<= (or (car params) 0) 255))
-                (setf (eat--t-term-sixel-color eat--t-term)
-                      (or (car params) 0)))
+                (push (vector 'sixel-set-color (or (car params) 0)) actions)
+                (cl-incf action-count))
               (when (= (length params) 5)
                 (cl-destructuring-bind (z y x coord-sys reg) params
-                  (eat--t-sixel-set-color-reg
-                   (or reg 0) (list coord-sys (or x 0) (or y 0)
-                                    (or z 0))))))
+                  (push (vector 'sixel-set-color-reg
+                                (or reg 0) (list coord-sys (or x 0) (or y 0)
+                                                 (or z 0))) actions)
+                  (cl-incf action-count))))
              ('rle
-              (eat--t-sixel-write output index (1+ index)
-                                  (or (car params) 0))
+              (push (vector 'sixel-write output index (1+ index)
+                            (or (car params) 0)) actions)
+              (cl-incf action-count)
               (cl-incf index))
              ('set-raster-attr
               ;; TODO: Implement.
@@ -3814,7 +3999,8 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                    (while (and (/= index (length output))
                                (<= ?? (aref output index) ?~))
                      (cl-incf index))
-                   (eat--t-sixel-write output ins-beg index 1))
+                   (push (vector 'sixel-write output ins-beg index 1) actions)
+                   (cl-incf action-count))
                (cl-incf index)
                (pcase (aref output (1- index))
                  (?!
@@ -3823,12 +4009,11 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                                           ,(list nil)))
                   (setq loop nil))
                  (?-
-                  (eat--t-sixel-newline))
+                  (push (vector 'sixel-newline) actions)
+                  (cl-incf action-count))
                  (?$
-                  (setf (eat--t-cur-sixel-x
-                         (eat--t-disp-cursor
-                          (eat--t-term-display eat--t-term)))
-                        0))
+                  (push (vector 'sixel-cursor-x-reset) actions)
+                  (cl-incf action-count))
                  (?\#
                   (setf (eat--t-term-parser-state eat--t-term)
                         `(read-dcs-params (read-sixel set-color)
@@ -3840,7 +4025,8 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                                           ,(list nil)))
                   (setq loop nil))
                  (?\e
-                  (eat--t-sixel-cleanup)
+                  (push (vector 'sixel-cleanup) actions)
+                  (cl-incf action-count)
                   (setf (eat--t-term-parser-state eat--t-term)
                         '(read-potential-st (read-dcs-fallback)))
                   (setq loop nil)))))))
@@ -3865,24 +4051,30 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                (setq index (match-end 0))
                (setf (eat--t-term-parser-state eat--t-term) nil)
                ;; Set the character set.
-               (eat--t-set-charset
-                slot
-                (pcase str
-                  ;; ESC ( 0.
-                  ;; ESC ) 0.
-                  ;; ESC * 0.
-                  ;; ESC + 0.
-                  ("0" 'dec-line-drawing)
-                  ;; ESC ( B.
-                  ;; ESC ) B.
-                  ;; ESC * B.
-                  ;; ESC + B.
-                  ("B" 'us-ascii)))))))
+               (push (vector 'set-charset
+                             slot
+                             (pcase str
+                               ;; ESC ( 0.
+                               ;; ESC ) 0.
+                               ;; ESC * 0.
+                               ;; ESC + 0.
+                               ("0" 'dec-line-drawing)
+                               ;; ESC ( B.
+                               ;; ESC ) B.
+                               ;; ESC * B.
+                               ;; ESC + B.
+                               ("B" 'us-ascii))) actions)
+               (cl-incf action-count)))))
         (`(read-charset-vt300 ,_slot)
          (cl-incf index)
          (setf (eat--t-term-parser-state eat--t-term) nil)
          ;; Nothing.  This is here to just recognize the sequence.
-         )))))
+         )))
+    (nreverse actions)))
+
+(defun eat--t-handle-output (output)
+  "Parse and evaluate OUTPUT."
+  (eat--t-dispatch-actions (eat--t-parse-output output)))
 
 (defun eat--t-resize (width height)
   "Resize terminal to WIDTH x HEIGHT."
@@ -6631,7 +6823,8 @@ END if it's safe to do so."
           eat--pending-output-chunks
           eat--output-queue-first-chunk-time
           eat--process-output-queue-timer
-          eat--shell-prompt-annotation-correction-timer))
+          eat--shell-prompt-annotation-correction-timer
+          eat--synchronized-output-timer))
   ;; This is intended; input methods don't work on read-only buffers.
   (setq buffer-read-only nil)
   (setq scroll-margin 0)
@@ -6766,12 +6959,31 @@ The output chunks are pushed, so last output appears first.")
 (defvar eat--shell-prompt-annotation-correction-timer nil
   "Timer to correct shell prompt annotations.")
 
+(defvar eat--synchronized-output-timer nil
+  "Safety timer for synchronized output mode.")
+
+(defvar eat--t-last-sync-transition nil
+  "Index of the last sync mode transition in the current parse.
+Set by `eat--t-enable-synchronized-output' and
+`eat--t-disable-synchronized-output' during parsing.  Value is
+the action-count at the transition point (pre-nreverse), or nil
+if no transition occurred.")
+
 (defun eat-kill-process ()
   "Kill Eat process in current buffer."
   (interactive)
   (when-let* ((eat-terminal)
               (proc (eat-term-parameter eat-terminal 'eat--process)))
     (delete-process proc)))
+
+(defvar eat--inhibit-input-chunking nil
+  "When non-nil, inhibit the input chunking behavior of `eat--send-string'.
+
+Normally, `eat--send-string' chunks input and pauses to parse output
+between chunks. This causes problematic recursion if we need to write
+input back to the host while we are in already in the middle of
+processing output (e.g., to send responses to a DECRQM). This can be
+let-bound to t during output processing to inhibit that behavior.")
 
 (defun eat--send-string (process string)
   "Send to PROCESS the contents of STRING as input.
@@ -6780,21 +6992,70 @@ This is equivalent to `process-send-string', except that long input
 strings are broken up into chunks of size `eat-input-chunk-size'.
 Processes are given a chance to output between chunks.  This can help
 prevent processes from hanging when you send them long inputs on some
-OS's."
-  (let ((i 0)
-        (j eat-input-chunk-size)
-        (l (length string)))
-    (while (< i l)
-      (process-send-string process (substring string i (min j l)))
-      (accept-process-output)
-      (cl-incf i eat-input-chunk-size)
-      (cl-incf j eat-input-chunk-size))))
+OS's.
+
+When `eat--inhibit-input-chunking' is non-nil, call
+`process-send-string' directly and suppress any chunking behavior."
+  (if eat--inhibit-input-chunking
+      (process-send-string process string)
+    (let ((i 0)
+          (j eat-input-chunk-size)
+          (l (length string)))
+      (while (< i l)
+        (process-send-string process (substring string i (min j l)))
+        (accept-process-output)
+        (cl-incf i eat-input-chunk-size)
+        (cl-incf j eat-input-chunk-size)))))
 
 (defun eat--send-input (_ input)
   "Send INPUT to subprocess."
   (when-let* ((eat-terminal)
               (proc (eat-term-parameter eat-terminal 'eat--process)))
     (eat--send-string proc input)))
+
+(defun eat--drain-output-queue ()
+  "Drain `eat--pending-output-chunks' by dispatching queued actions.
+Cancels pending drain and sync timers, clears the first-chunk-time
+marker, dispatches all queued actions against `eat-terminal', and
+redisplays.  Also truncates scrollback if it has grown beyond
+`eat-term-scrollback-size'.
+
+Assumes the caller has already entered the terminal buffer and
+established any buffer-level protections it needs
+(`inhibit-quit', scroll synchronization, etc.)."
+  (let ((inhibit-read-only t)
+        (inhibit-modification-hooks t)
+        ;; Don't let `undo' mess up with the terminal.
+        (buffer-undo-list t)
+        ;; Terminal-generated replies emitted from inside action
+        ;; dispatch must not yield via `accept-process-output',
+        ;; which would re-enter the process filter and reorder
+        ;; the byte stream.
+        (eat--inhibit-input-chunking t))
+    (when eat--process-output-queue-timer
+      (cancel-timer eat--process-output-queue-timer)
+      (setq eat--process-output-queue-timer nil))
+    (when eat--synchronized-output-timer
+      (cancel-timer eat--synchronized-output-timer)
+      (setq eat--synchronized-output-timer nil))
+    (setq eat--output-queue-first-chunk-time nil)
+    (while eat--pending-output-chunks
+      (let ((queue eat--pending-output-chunks)
+            (eat--output-queue-first-chunk-time t))
+        (setq eat--pending-output-chunks nil)
+        (eat--t-with-env eat-terminal
+          (dolist (actions (nreverse queue))
+            (eat--t-dispatch-actions actions)))))
+    (eat-term-redisplay eat-terminal)
+    ;; Truncate output of previous dead processes.
+    (when (and eat-term-scrollback-size
+               (< eat-term-scrollback-size
+                  (- (point) (point-min))))
+      (delete-region
+       (point-min)
+       (max (point-min)
+            (- (eat-term-display-beginning eat-terminal)
+               eat-term-scrollback-size))))))
 
 (defun eat--process-output-queue (buffer)
   "Process the output queue on BUFFER."
@@ -6805,29 +7066,10 @@ OS's."
             (eat--auto-line-mode-pending-toggles nil))
         (save-restriction
           (widen)
+          (eat--drain-output-queue)
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
-                ;; Don't let `undo' mess up with the terminal.
                 (buffer-undo-list t))
-            (when eat--process-output-queue-timer
-              (cancel-timer eat--process-output-queue-timer))
-            (setq eat--output-queue-first-chunk-time nil)
-            (while eat--pending-output-chunks
-              (let ((queue eat--pending-output-chunks)
-                    (eat--output-queue-first-chunk-time t))
-                (setq eat--pending-output-chunks nil)
-                (dolist (output (nreverse queue))
-                  (eat-term-process-output eat-terminal output))))
-            (eat-term-redisplay eat-terminal)
-            ;; Truncate output of previous dead processes.
-            (when (and eat-term-scrollback-size
-                       (< eat-term-scrollback-size
-                          (- (point) (point-min))))
-              (delete-region
-               (point-min)
-               (max (point-min)
-                    (- (eat-term-display-beginning eat-terminal)
-                       eat-term-scrollback-size))))
             (setq eat--shell-prompt-annotation-correction-timer
                   (run-with-timer
                    eat-shell-prompt-annotation-correction-delay
@@ -6843,30 +7085,76 @@ OS's."
         (funcall eat--synchronize-scroll-function sync-windows))
       (run-hooks 'eat-update-hook))))
 
+(defun eat--filter-queue-actions (actions sync buffer &optional drain-fn)
+  "Queue ACTIONS with timer behavior based on SYNC state.
+BUFFER is the terminal buffer.  DRAIN-FN is the drain function to
+schedule or invoke when a flush is required; it defaults to
+`eat--process-output-queue'."
+  (when actions
+    (let ((drain-fn (or drain-fn #'eat--process-output-queue)))
+      (unless eat--output-queue-first-chunk-time
+        (setq eat--output-queue-first-chunk-time (current-time)))
+      (push actions eat--pending-output-chunks)
+      (unless (eq eat--output-queue-first-chunk-time t)
+        (if sync
+            ;; Sync mode: use safety timeout, ignore min latency.
+            (let ((time-left
+                   (- eat-synchronized-output-timeout
+                      (float-time
+                       (time-subtract
+                        nil eat--output-queue-first-chunk-time)))))
+              (if (<= time-left 0)
+                  (funcall drain-fn buffer)
+                (when eat--synchronized-output-timer
+                  (cancel-timer eat--synchronized-output-timer))
+                (setq eat--synchronized-output-timer
+                      (run-with-timer
+                       time-left nil drain-fn buffer))))
+          ;; Normal mode.
+          (let ((time-left
+                 (- eat-maximum-latency
+                    (float-time
+                     (time-subtract
+                      nil eat--output-queue-first-chunk-time)))))
+            (if (<= time-left 0)
+                (funcall drain-fn buffer)
+              (when eat--process-output-queue-timer
+                (cancel-timer eat--process-output-queue-timer))
+              (setq eat--process-output-queue-timer
+                    (run-with-timer
+                     (min time-left eat-minimum-latency) nil
+                     drain-fn buffer)))))))))
+
 (defun eat--filter (process output)
   "Handle OUTPUT from PROCESS."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
-      (when eat--process-output-queue-timer
-        (cancel-timer eat--process-output-queue-timer))
-      (when eat--shell-prompt-annotation-correction-timer
-        (cancel-timer eat--shell-prompt-annotation-correction-timer))
-      (unless eat--output-queue-first-chunk-time
-        (setq eat--output-queue-first-chunk-time (current-time)))
-      (push output eat--pending-output-chunks)
-      (unless (eq eat--output-queue-first-chunk-time t)
-        (let ((time-left
-               (- eat-maximum-latency
-                  (float-time
-                   (time-subtract
-                    nil eat--output-queue-first-chunk-time)))))
-          (if (<= time-left 0)
-              (eat--process-output-queue (current-buffer))
-            (setq eat--process-output-queue-timer
-                  (run-with-timer
-                   (min time-left eat-minimum-latency) nil
-                   #'eat--process-output-queue
-                   (current-buffer)))))))))
+      ;; Parse immediately.
+      (let* ((eat--t-term eat-terminal)
+             (eat--t-last-sync-transition nil)
+             (actions (eat--t-parse-output output))
+             (is-sync (eat--t-term-synchronized-output eat--t-term)))
+        (when eat--shell-prompt-annotation-correction-timer
+          (cancel-timer eat--shell-prompt-annotation-correction-timer))
+        (if (null eat--t-last-sync-transition)
+            ;; No sync transition — queue everything with current timing.
+            (eat--filter-queue-actions actions is-sync (current-buffer))
+          ;; Transition occurred — split at last transition point.
+          ;; eat--t-last-sync-transition is the action-count at the
+          ;; moment of transition.  Since actions are nreversed into
+          ;; chronological order, this is directly the split index.
+          (let* ((split-idx eat--t-last-sync-transition)
+                 (pre (and (> split-idx 0)
+                           (seq-subseq actions 0 split-idx)))
+                 (post (seq-subseq actions split-idx)))
+            ;; Flush everything before the last transition.
+            (when pre
+              (push pre eat--pending-output-chunks)
+              (eat--process-output-queue (current-buffer)))
+            ;; Queue the rest with timing based on final state.
+            (when post
+              (eat--filter-queue-actions
+               post is-sync (current-buffer)))))))))
 
 (defun eat--sentinel (process message)
   "Sentinel for Eat buffers.
@@ -6883,9 +7171,6 @@ to it."
                   ;; will set the buffer point automatically by
                   ;; writing to the buffer.
                   (eat--synchronize-scroll-function #'ignore))
-              (when eat--process-output-queue-timer
-                (cancel-timer eat--process-output-queue-timer)
-                (setq eat--process-output-queue-timer nil))
               (eat--process-output-queue buffer)
               (when eat--shell-prompt-annotation-correction-timer
                 (cancel-timer
@@ -7316,29 +7601,6 @@ PROGRAM can be a shell command."
   "Return the value of `TERM' environment variable for Eshell."
   (eat-term-name))
 
-(defun eat--eshell-output-filter ()
-  "Handle output from subprocess."
-  (let ((inhibit-quit t)            ; Don't disturb!
-        (str (buffer-substring-no-properties
-              eshell-last-output-start
-              eshell-last-output-end)))
-    (let ((inhibit-read-only t))
-      (delete-region eshell-last-output-start eshell-last-output-end))
-    (let ((sync-windows (eat--synchronize-scroll-windows))
-          (inhibit-read-only t))
-      (eat-term-process-output eat-terminal str)
-      (eat-term-redisplay eat-terminal)
-      (funcall eat--synchronize-scroll-function sync-windows))
-    (let ((inhibit-read-only t))
-      (let ((end (eat-term-end eat-terminal)))
-        (set-marker eshell-last-output-start end)
-        (set-marker eshell-last-output-end end)
-        (set-marker (process-mark
-                     (eat-term-parameter
-                      eat-terminal 'eat--output-process))
-                    end))))
-  (run-hooks 'eat-eshell-update-hook))
-
 (defun eat--eshell-setup-proc-and-term (proc)
   "Setup process PROC and a new terminal for it."
   (unless eat-terminal
@@ -7371,13 +7633,12 @@ PROGRAM can be a shell command."
       (setf (eat-term-parameter eat-terminal 'eat--input-process)
             proc))
     (setf (eat-term-parameter eat-terminal 'eat--output-process) proc)
-    (when-let* ((window (get-buffer-window nil t)))
-      (with-selected-window window
-        (eat-term-resize eat-terminal (window-max-chars-per-line)
-                         (floor (window-screen-lines)))))
+    (let ((windows (get-buffer-window-list nil nil t)))
+      (when windows
+        (when-let* ((size (eat--adjust-process-window-size
+                           proc windows)))
+          (set-process-window-size proc (cdr size) (car size)))))
     (eat-term-redisplay eat-terminal)
-    (setq-local eshell-output-filter-functions
-                '(eat--eshell-output-filter))
     (eat--eshell-process-running-mode +1)
     (eat-eshell-semi-char-mode)
     (run-hooks 'eat-eshell-exec-hook)))
@@ -7403,7 +7664,6 @@ PROGRAM can be a shell command."
          #'eshell-interactive-process-filter))
       (eat-term-delete eat-terminal)
       (setq eat-terminal nil)
-      (kill-local-variable 'eshell-output-filter-functions)
       (eat--eshell-semi-char-mode -1)
       (eat--eshell-char-mode -1)
       (eat--eshell-process-running-mode -1)
@@ -7414,53 +7674,62 @@ PROGRAM can be a shell command."
 (declare-function eshell-interactive-process-filter "esh-mode"
                   (process string))
 
-(defun eat--eshell-process-output-queue (process buffer)
-  "Process the output queue on BUFFER from PROCESS."
+(defun eat--eshell-process-output-queue (buffer)
+  "Process the output queue on BUFFER for an eshell terminal.
+Dispatches queued action lists directly against the terminal
+display (no round-trip through `eshell-output-filter'), then
+advances eshell's output markers and the output process's
+`process-mark' to the new terminal end."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when eat--process-output-queue-timer
-        (cancel-timer eat--process-output-queue-timer))
-      (setq eat--output-queue-first-chunk-time nil)
-      (while eat--pending-output-chunks
-        (let ((queue eat--pending-output-chunks)
-              (eat--output-queue-first-chunk-time t))
-          (setq eat--pending-output-chunks nil)
-          (if (eval-when-compile (< emacs-major-version 27))
-              (eshell-output-filter
-               process (string-join (nreverse queue)))
-            (combine-change-calls
-                (eat-term-beginning eat-terminal)
-                (eat-term-end eat-terminal)
-              ;; TODO: Is `string-join' OK or should we use a loop?
-              (if (eval-when-compile (< emacs-major-version 30))
-                  (eshell-output-filter
-                   process (string-join (nreverse queue)))
-                (eshell-interactive-process-filter
-                 process (string-join (nreverse queue)))))))))))
+      (let ((inhibit-quit t)
+            (sync-windows (eat--synchronize-scroll-windows)))
+        (if (eval-when-compile (< emacs-major-version 27))
+            (eat--drain-output-queue)
+          (combine-change-calls
+              (eat-term-beginning eat-terminal)
+              (eat-term-end eat-terminal)
+            (eat--drain-output-queue)))
+        (let ((end (eat-term-end eat-terminal)))
+          (set-marker eshell-last-output-start end)
+          (set-marker eshell-last-output-end end)
+          (when-let* ((proc (eat-term-parameter
+                             eat-terminal 'eat--output-process)))
+            (set-marker (process-mark proc) end)))
+        (funcall eat--synchronize-scroll-function sync-windows))
+      (run-hooks 'eat-eshell-update-hook))))
 
 (defun eat--eshell-filter (process string)
   "Process output STRING from PROCESS."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
-      (when eat--process-output-queue-timer
-        (cancel-timer eat--process-output-queue-timer))
-      (unless eat--output-queue-first-chunk-time
-        (setq eat--output-queue-first-chunk-time (current-time)))
-      (push string eat--pending-output-chunks)
-      (unless (eq eat--output-queue-first-chunk-time t)
-        (let ((time-left
-               (- eat-maximum-latency
-                  (float-time
-                   (time-subtract
-                    nil eat--output-queue-first-chunk-time)))))
-          (if (<= time-left 0)
-              (eat--eshell-process-output-queue
-               process (current-buffer))
-            (setq eat--process-output-queue-timer
-                  (run-with-timer
-                   (min time-left eat-minimum-latency) nil
-                   #'eat--eshell-process-output-queue process
-                   (current-buffer)))))))))
+      ;; Parse immediately.
+      (let* ((eat--t-term eat-terminal)
+             (eat--t-last-sync-transition nil)
+             (actions (eat--t-parse-output string))
+             (is-sync (eat--t-term-synchronized-output eat--t-term)))
+        (if (null eat--t-last-sync-transition)
+            ;; No sync transition — queue everything with current timing.
+            (eat--filter-queue-actions
+             actions is-sync (current-buffer)
+             #'eat--eshell-process-output-queue)
+          ;; Transition occurred — split at last transition point.
+          ;; `eat--t-last-sync-transition' is the action-count at the
+          ;; moment of transition.  Since actions are nreversed into
+          ;; chronological order, this is directly the split index.
+          (let* ((split-idx eat--t-last-sync-transition)
+                 (pre (and (> split-idx 0)
+                           (seq-subseq actions 0 split-idx)))
+                 (post (seq-subseq actions split-idx)))
+            ;; Flush everything before the last transition.
+            (when pre
+              (push pre eat--pending-output-chunks)
+              (eat--eshell-process-output-queue (current-buffer)))
+            ;; Queue the rest with timing based on final state.
+            (when post
+              (eat--filter-queue-actions
+               post is-sync (current-buffer)
+               #'eat--eshell-process-output-queue))))))))
 
 (declare-function eshell-sentinel "esh-proc" (proc string))
 
@@ -7479,7 +7748,7 @@ PROGRAM can be a shell command."
                     (when (or (not (eq proc process))
                               (process-live-p proc))
                       (funcall process-send-string proc string)))))
-        (eat--eshell-process-output-queue process (current-buffer)))
+        (eat--eshell-process-output-queue (current-buffer)))
       (when (memq (process-status process) '(signal exit))
         (eat--eshell-cleanup))))
   (eshell-sentinel process message))
@@ -7508,53 +7777,57 @@ Disable terminal emulation? ")))
                  ((and (pred functionp) function)
                   (apply function command args)))))
       (funcall fn command args)
-    (let ((hook (lambda (proc)
-                  (set-process-filter proc #'eat--eshell-filter)
-                  (set-process-sentinel proc #'eat--eshell-sentinel)
-                  (eat--eshell-setup-proc-and-term proc))))
-      (add-hook 'eshell-exec-hook hook 99)
-      (unwind-protect
-          (cond
-           ;; Emacs 29 and above.
-           ((eval-when-compile (>= emacs-major-version 29))
-            (cl-letf*
-                ((make-process (symbol-function #'make-process))
-                 ((symbol-function #'make-process)
-                  (lambda (&rest plist)
-                    ;; Make sure we don't attack wrong process.
-                    (if (not (equal
-                              (plist-get plist :command)
-                              (cons (file-local-name
-                                     (expand-file-name command))
-                                    args)))
-                        (apply make-process plist)
-                      (setf (plist-get plist :command)
-                            `("/usr/bin/env" "sh" "-c"
-                              ,(format "stty -nl echo rows %d columns\
+    (let* ((windows (get-buffer-window-list nil nil t))
+           (size (and windows
+                      (funcall window-adjust-process-window-size-function
+                               nil windows)))
+           (cols (if size (max (car size) 1)
+                   (window-max-chars-per-line)))
+           (rows (if size (max (cdr size) 1)
+                   (floor (window-screen-lines)))))
+      (let ((hook (lambda (proc)
+                    (set-process-filter proc #'eat--eshell-filter)
+                    (set-process-sentinel proc #'eat--eshell-sentinel)
+                    (eat--eshell-setup-proc-and-term proc))))
+        (add-hook 'eshell-exec-hook hook 99)
+        (unwind-protect
+            (cond
+             ;; Emacs 29 and above.
+             ((eval-when-compile (>= emacs-major-version 29))
+              (cl-letf*
+                  ((make-process (symbol-function #'make-process))
+                   ((symbol-function #'make-process)
+                    (lambda (&rest plist)
+                      ;; Make sure we don't attack wrong process.
+                      (if (not (equal
+                                (plist-get plist :command)
+                                (cons (file-local-name
+                                       (expand-file-name command))
+                                      args)))
+                          (apply make-process plist)
+                        (setf (plist-get plist :command)
+                              `("/usr/bin/env" "sh" "-c"
+                                ,(format "stty -nl echo rows %d columns\
  %d sane 2>%s ; if [ $1 = .. ]; then shift; fi; exec \"$@\""
-                                       (floor (window-screen-lines))
-                                       (window-max-chars-per-line)
-                                       null-device)
-                              ".." ,@(plist-get plist :command)))
-                      (apply make-process plist)))))
-              (funcall fn command args)))
-           ;; Emacs 28.
-           (t
-            (cl-letf*
-                ((start-file-process
-                  (symbol-function #'start-file-process))
-                 ((symbol-function #'start-file-process)
-                  (lambda (name buffer &rest command)
-                    (apply start-file-process name buffer
-                           "/usr/bin/env" "sh" "-c"
-                           (format "stty -nl echo rows %d columns %d \
+                                         rows cols null-device)
+                                ".." ,@(plist-get plist :command)))
+                        (apply make-process plist)))))
+                (funcall fn command args)))
+             ;; Emacs 28.
+             (t
+              (cl-letf*
+                  ((start-file-process
+                    (symbol-function #'start-file-process))
+                   ((symbol-function #'start-file-process)
+                    (lambda (name buffer &rest command)
+                      (apply start-file-process name buffer
+                             "/usr/bin/env" "sh" "-c"
+                             (format "stty -nl echo rows %d columns %d \
 sane 2>%s ; if [ $1 = .. ]; then shift; fi; exec \"$@\""
-                                   (floor (window-screen-lines))
-                                   (window-max-chars-per-line)
-                                   null-device)
-                           ".." command))))
-              (funcall fn command args))))
-        (remove-hook 'eshell-exec-hook hook)))))
+                                     rows cols null-device)
+                             ".." command))))
+                (funcall fn command args))))
+          (remove-hook 'eshell-exec-hook hook))))))
 
 (defun eat--eshell-set-input-process (&rest _)
   "Set the process that gets user input."
@@ -8065,29 +8338,6 @@ see."
                                     variables)))))))))
     (apply fn args)))
 
-(defun eat--trace-eshell-output-filter (fn)
-  "Trace `eat--eshell-output-filter'.
-
-FN is the original definition of `eat--eshell-output-filter', which
-see."
-  (if (not (buffer-live-p eat--trace-output-buffer))
-      (funcall fn)
-    (cl-letf* ((eat-term-process-output
-                (symbol-function #'eat-term-process-output))
-               ((symbol-function #'eat-term-process-output)
-                (lambda (terminal output)
-                  (with-current-buffer eat--trace-output-buffer
-                    (eat--trace-log nil 'output output))
-                  (funcall eat-term-process-output terminal output)))
-               (eat-term-redisplay
-                (symbol-function #'eat-term-redisplay))
-               ((symbol-function #'eat-term-redisplay)
-                (lambda (terminal)
-                  (with-current-buffer eat--trace-output-buffer
-                    (eat--trace-log nil 'redisplay))
-                  (funcall eat-term-redisplay terminal))))
-      (funcall fn))))
-
 (defun eat--trace-eshell-cleanup (fn)
   "Trace `eat--eshell-cleanup'.
 
@@ -8117,8 +8367,6 @@ FN is the original definition of `eat--eshell-cleanup', which see."
         (advice-add #'eat-reset :around #'eat--trace-reset)
         (advice-add #'eat--eshell-adjust-make-process-args :around
                     #'eat--trace-eshell-adjust-make-process-args)
-        (advice-add #'eat--eshell-output-filter :around
-                    #'eat--trace-eshell-output-filter)
         (advice-add #'eat--eshell-cleanup :around
                     #'eat--trace-eshell-cleanup))
     (advice-remove #'eat-exec #'eat--trace-exec)
@@ -8130,8 +8378,6 @@ FN is the original definition of `eat--eshell-cleanup', which see."
     (advice-remove #'eat-reset #'eat--trace-reset)
     (advice-remove #'eat--eshell-adjust-make-process-args
                    #'eat--trace-eshell-adjust-make-process-args)
-    (advice-remove #'eat--eshell-output-filter
-                   #'eat--trace-eshell-output-filter)
     (advice-remove #'eat--eshell-cleanup
                    #'eat--trace-eshell-cleanup)
     (dolist (buffer (buffer-list))
