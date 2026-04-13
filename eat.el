@@ -4637,9 +4637,19 @@ client process may get confused."
                                    (append (remq 'meta mods)
                                            (list base)))
                              (?\C-\s ?\C-@)
-                             (?\C-/ ?\C-?)
+                             (?\C-/ ?\C-_)
                              (?\C-- ?\C-_)
                              (c c))))
+                   ;; If event-convert-list returned a non-character
+                   ;; (modifier bits still set), fall back to xterm
+                   ;; ctrl conventions for the base character.
+                   ;; See xterm input.c lines 283-313.
+                   (unless (characterp ch)
+                     (setq ch (pcase base
+                                (?\s ?\C-@) (?` ?\C-@)
+                                (?2 ?\C-@) (?3 ?\e) (?4 ?\C-\\)
+                                (?5 ?\C-]) (?6 ?\C-^) (?~ ?\C-^)
+                                (?7 ?\C-_) (?8 ?\C-?) (?? ?\C-?))))
                    (when (characterp ch)
                      (send (cond
                             ((and (memq 'meta mods)
@@ -4887,8 +4897,11 @@ EXCEPTIONS is a list of key sequences to not bind.  Don't use
                         S-deletechar C-M-deletechar C-S-deletechar
                         M-S-deletechar C-M-S-deletechar))
           (bind (vector key)))
-        ;; Bind these non-encodable keys.  They are translated.
-        (dolist (key '(?\C-- ?\C-? ?\C-\s))
+        ;; Bind these non-encodable keys.  In GUI Emacs, C-/ is a
+        ;; distinct event from C-_ (ASCII 31), and `escape' is a
+        ;; distinct event from byte 27 (meta-prefix-char), so bind
+        ;; them explicitly.
+        (dolist (key '(?\C-- ?\C-? ?\C-\s ?\C-/ escape))
           (bind (vector key)))
         ;; Bind M-<ASCII> keys.
         (unless (member (vector meta-prefix-char) exceptions)
