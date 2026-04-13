@@ -6064,15 +6064,30 @@ EVENT is the mouse event."
   (eat-term-make-keymap #'eat-self-input '(:mouse-movement) nil)
   "Keymap for `eat--mouse-movement-mode'.")
 
+(defvar eat--emulation-mode-map-alist nil
+  "Alist used via `emulation-mode-map-alists' for Eat terminal keymaps.
+This ensures Eat's semi-char and char mode keymaps take priority
+over all other minor mode keymaps (e.g., undo-tree-mode).")
+
 (define-minor-mode eat--semi-char-mode
   "Minor mode for semi-char mode keymap."
   :interactive nil
-  :keymap eat-semi-char-mode-map)
+  (when eat--semi-char-mode
+    (setq-local eat--emulation-mode-map-alist
+                `((eat--semi-char-mode . ,eat-semi-char-mode-map)))
+    (unless (memq 'eat--emulation-mode-map-alist
+                  emulation-mode-map-alists)
+      (push 'eat--emulation-mode-map-alist emulation-mode-map-alists))))
 
 (define-minor-mode eat--char-mode
   "Minor mode for char mode keymap."
   :interactive nil
-  :keymap eat-char-mode-map)
+  (when eat--char-mode
+    (setq-local eat--emulation-mode-map-alist
+                `((eat--char-mode . ,eat-char-mode-map)))
+    (unless (memq 'eat--emulation-mode-map-alist
+                  emulation-mode-map-alists)
+      (push 'eat--emulation-mode-map-alist emulation-mode-map-alists))))
 
 (define-minor-mode eat--mouse-click-mode
   "Minor mode for mouse click keymap."
