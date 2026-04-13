@@ -7342,6 +7342,8 @@ same Eat buffer.  The hook `eat-exec-hook' is run after each exec."
                 (concat "INSIDE_EMACS=" eat-term-inside-emacs)
                 (concat "EAT_SHELL_INTEGRATION_DIR="
                         eat-term-shell-integration-directory))
+               (when (> (display-color-cells) 256)
+                 (list "COLORTERM=truecolor"))
                process-environment))
              (process-connection-type t)
              ;; We should suppress conversion of end-of-line format.
@@ -7659,6 +7661,11 @@ PROGRAM can be a shell command."
   "Return the value of `TERM' environment variable for Eshell."
   (eat-term-name))
 
+(defun eat--eshell-colorterm (&rest _)
+  "Return the value of `COLORTERM' environment variable for Eshell."
+  (when (> (display-color-cells) 256)
+    "truecolor"))
+
 (defun eat--eshell-setup-proc-and-term (proc)
   "Setup process PROC and a new terminal for it."
   (unless eat-terminal
@@ -7950,6 +7957,7 @@ symbol `buffer', in which case the point of current buffer is set."
             `(("TERM" eat--eshell-term-name t)
               ("TERMINFO" eat-term-terminfo-directory t)
               ("INSIDE_EMACS" eat-term-inside-emacs t)
+              ("COLORTERM" eat--eshell-colorterm t)
               ("EAT_SHELL_INTEGRATION_DIR"
                eat-term-shell-integration-directory t)
               ,@eshell-variable-aliases-list))
@@ -7970,6 +7978,7 @@ symbol `buffer', in which case the point of current buffer is set."
                        '(("TERM" eat--eshell-term-name t)
                          ("TERMINFO" eat-term-terminfo-directory t)
                          ("INSIDE_EMACS" eat-term-inside-emacs t)
+                         ("COLORTERM" eat--eshell-colorterm t)
                          ("EAT_SHELL_INTEGRATION_DIR"
                           eat-term-shell-integration-directory t))))
              eshell-variable-aliases-list))))))
