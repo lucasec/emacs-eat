@@ -1197,6 +1197,7 @@ Nil when not in alternative display mode.")
   (mouse-encoding nil :documentation "Current mouse event encoding.")
   (focus-event-mode nil :documentation "Whether to send focus event.")
   (synchronized-output nil :documentation "State of synchronized output mode.")
+  (color-palette-update nil :documentation "State of color palette update notification mode (2031).")
   (cut-buffers
    (1value (make-vector 8 nil))
    :documentation "Cut buffers.")
@@ -1310,6 +1311,7 @@ Don't `set' it, bind it to a value with `let'.")
     (setf (eat--t-term-mouse-encoding eat--t-term) nil)
     (setf (eat--t-term-focus-event-mode eat--t-term) nil)
     (setf (eat--t-term-synchronized-output eat--t-term) nil)
+    (setf (eat--t-term-color-palette-update eat--t-term) nil)
     (setf (eat--t-term-sixel-scroll-mode eat--t-term) t)
     ;; Clear everything.
     (delete-region (point-min) (point-max))
@@ -2959,6 +2961,68 @@ reading an attribute is supported)."
      (format "\e]11;rgb:%04x/%04x/%04x\e\\"
              (pop rgb) (pop rgb) (pop rgb)))))
 
+(defun eat--t-color-palette-response ()
+  "Return the color palette DSR response for the current background mode.
+
+Return the dark mode response if the background is dark, otherwise
+the light mode response."
+  (if (eq (frame-parameter nil 'background-mode) 'dark)
+      "\e[?997;1n"
+    "\e[?997;2n"))
+
+(defvar eat--color-palette-update-bg-mode nil
+  "Cached background mode for color palette update notifications.")
+
+(defun eat--t-enable-color-palette-update ()
+  "Enable color palette update notification mode (2031)."
+  (setf (eat--t-term-color-palette-update eat--t-term) t)
+  ;; Cache the current background mode for change detection.
+  (setq eat--color-palette-update-bg-mode
+        (frame-parameter nil 'background-mode))
+  ;; Send the current state immediately on subscribe.
+  (funcall (eat--t-term-input-fn eat--t-term) eat--t-term
+           (eat--t-color-palette-response)))
+
+(defun eat--t-disable-color-palette-update ()
+  "Disable color palette update notification mode (2031)."
+  (setf (eat--t-term-color-palette-update eat--t-term) nil))
+
+(defun eat--t-private-device-status-report (n)
+  "Report private device status.
+
+If N is 996, report the current color palette mode (dark or light)."
+  (pcase n
+    (996
+     (funcall (eat--t-term-input-fn eat--t-term) eat--t-term
+              (eat--t-color-palette-response)))))
+
+(defun eat--t-request-private-mode (n)
+  "Report the state of private mode N (DECRQM/DECRPM).
+
+Respond with mode set (1), mode reset (2), or mode not recognized (0)."
+  (let ((state
+         (pcase n
+           ;; Modes with tracked state.
+           (1 (if (eat--t-term-keypad-mode eat--t-term) 1 2))
+           (7 (if (eat--t-term-auto-margin eat--t-term) 1 2))
+           (25 (if (eat--t-term-cur-visible-p eat--t-term) 1 2))
+           ((or 9 1000 1002 1003)
+            (if (eat--t-term-mouse-mode eat--t-term) 1 2))
+           (1004 (if (eat--t-term-focus-event-mode eat--t-term) 1 2))
+           (1006 (if (eq (eat--t-term-mouse-encoding eat--t-term) 'sgr)
+                     1 2))
+           ((or 1047 1049)
+            (if (eat--t-term-main-display eat--t-term) 1 2))
+           (2004 (if (eat--t-term-bracketed-yank eat--t-term) 1 2))
+           (2026 (if (eat--t-term-synchronized-output eat--t-term) 1 2))
+           (2031 (if (eat--t-term-color-palette-update eat--t-term) 1 2))
+           ;; Supported but no tracked state — report as reset.
+           ((or 12 80 1048) 2)
+           ;; Not recognized.
+           (_ 0))))
+    (funcall (eat--t-term-input-fn eat--t-term) eat--t-term
+             (format "\e[?%d;%d$y" n state))))
+
 (defun eat--t-manipulate-selection (targets data)
   "Set and send current selection.
 
@@ -3388,7 +3452,9 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
          (`(,(or 1047 1049))
           (eat--t-enable-alt-disp))
          ('(2004)
-          (eat--t-enable-bracketed-yank)))))))
+          (eat--t-enable-bracketed-yank))
+         ('(2031)
+          (eat--t-enable-color-palette-update)))))))
 
 (defun eat--t-reset-modes (params format)
   "Reset modes according to PARAMS in format FORMAT."
@@ -3425,7 +3491,9 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
          ('(1049)
           (eat--t-disable-alt-disp))
          ('(2004)
-          (eat--t-disable-bracketed-yank)))))))
+          (eat--t-disable-bracketed-yank))
+         ('(2031)
+          (eat--t-disable-color-palette-update)))))))
 
 (defun eat--t-dispatch-actions (actions)
   "Execute parsed ACTIONS on the terminal."
@@ -3473,6 +3541,8 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
       ('reset-modes (eat--t-reset-modes (aref action 1) (aref action 2)))
       ('set-sgr-params (eat--t-set-sgr-params (aref action 1)))
       ('device-status-report (eat--t-device-status-report (aref action 1)))
+      ('private-device-status-report (eat--t-private-device-status-report (aref action 1)))
+      ('request-private-mode (eat--t-request-private-mode (aref action 1)))
       ('set-cursor-style (eat--t-set-cursor-style (aref action 1)))
       ('change-scroll-region (eat--t-change-scroll-region (aref action 1)
                                                            (aref action 2)))
@@ -3865,6 +3935,14 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                  ;; CSI 6 n.
                  (`((?n) nil ((,n)))
                   (push (vector 'device-status-report n) actions)
+                  (cl-incf action-count))
+                 ;; CSI ? <n> n.
+                 (`((?n) ?? ((,n)))
+                  (push (vector 'private-device-status-report n) actions)
+                  (cl-incf action-count))
+                 ;; CSI ? <n> $ p (DECRQM - Request Mode).
+                 (`((?p ?$) ?? ((,n)))
+                  (push (vector 'request-private-mode n) actions)
                   (cl-incf action-count))
                  ;; CSI <n> SP q.
                  (`((?q ?\ ) nil ((,n)))
@@ -6893,6 +6971,29 @@ END if it's safe to do so."
       (delete-region begin end))
     str))
 
+(defun eat--color-palette-update-check (&rest _)
+  "Notify terminals subscribed to color palette updates.
+
+Check if the background mode has changed and send a notification
+to all terminals with mode 2031 enabled."
+  (let ((bg-mode (frame-parameter nil 'background-mode)))
+    (dolist (buffer (buffer-list))
+      (when-let* ((terminal (buffer-local-value 'eat-terminal buffer))
+                  ((eat-term-live-p terminal))
+                  ((eat--t-term-color-palette-update terminal)))
+        (unless (eq bg-mode
+                    (buffer-local-value
+                     'eat--color-palette-update-bg-mode buffer))
+          (with-current-buffer buffer
+            (setq eat--color-palette-update-bg-mode bg-mode)
+            (let ((eat--t-term terminal))
+              (funcall (eat--t-term-input-fn eat--t-term) eat--t-term
+                       (eat--t-color-palette-response)))))))))
+
+(when (boundp 'enable-theme-functions)
+  (add-hook 'enable-theme-functions #'eat--color-palette-update-check)
+  (add-hook 'disable-theme-functions #'eat--color-palette-update-check))
+
 (define-derived-mode eat-mode fundamental-mode "Eat"
   "Major mode for Eat."
   :group 'eat-ui
@@ -6927,7 +7028,8 @@ END if it's safe to do so."
           eat--output-queue-first-chunk-time
           eat--process-output-queue-timer
           eat--shell-prompt-annotation-correction-timer
-          eat--synchronized-output-timer))
+          eat--synchronized-output-timer
+          eat--color-palette-update-bg-mode))
   ;; This is intended; input methods don't work on read-only buffers.
   (setq buffer-read-only nil)
   (setq scroll-margin 0)
@@ -7987,7 +8089,8 @@ symbol `buffer', in which case the point of current buffer is set."
                   eat--pending-output-chunks
                   eat--output-queue-first-chunk-time
                   eat--process-output-queue-timer
-                  eat--eshell-invocation-directory)))
+                  eat--eshell-invocation-directory
+                  eat--color-palette-update-bg-mode)))
     (cond
      (eat--eshell-local-mode
       (mapc #'make-local-variable locals)
