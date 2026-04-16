@@ -1198,6 +1198,9 @@ Nil when not in alternative display mode.")
   (focus-event-mode nil :documentation "Whether to send focus event.")
   (synchronized-output nil :documentation "State of synchronized output mode.")
   (color-palette-update nil :documentation "State of color palette update notification mode (2031).")
+  (hyperlink-uri nil :documentation "Current hyperlink URI, or nil.")
+  (hyperlink-id nil :documentation "Current hyperlink id parameter, or nil.")
+  (hyperlink-instance 0 :documentation "Counter incremented on each OSC 8 open.")
   (cut-buffers
    (1value (make-vector 8 nil))
    :documentation "Cut buffers.")
@@ -1312,6 +1315,9 @@ Don't `set' it, bind it to a value with `let'.")
     (setf (eat--t-term-focus-event-mode eat--t-term) nil)
     (setf (eat--t-term-synchronized-output eat--t-term) nil)
     (setf (eat--t-term-color-palette-update eat--t-term) nil)
+    (setf (eat--t-term-hyperlink-uri eat--t-term) nil)
+    (setf (eat--t-term-hyperlink-id eat--t-term) nil)
+    (setf (eat--t-term-hyperlink-instance eat--t-term) 0)
     (setf (eat--t-term-sixel-scroll-mode eat--t-term) t)
     ;; Clear everything.
     (delete-region (point-min) (point-max))
@@ -1715,6 +1721,160 @@ If PRESERVE-FACE is non-nil, preserve original face."
 The key is the output character from client, and value of the
 character to actually show.")
 
+;;;;; Hyperlink support.
+
+(defun eat--open-hyperlink (uri)
+  "Open hyperlink URI, dispatching by scheme.
+For file:// URIs, validate the hostname against the local system
+before opening, as required by the OSC 8 spec.  For other schemes,
+delegate to `browse-url'."
+  (when (and uri (not (string-empty-p uri)))
+    (let ((parsed (url-generic-parse-url uri)))
+      (if (string= (url-type parsed) "file")
+          (when (let ((host (or (url-host parsed) "")))
+                  (or (string= host "")
+                      (string= host "localhost")
+                      (string-equal-ignore-case host (system-name))))
+            (browse-url uri))
+        (browse-url uri)))))
+
+(defun eat-open-hyperlink-at-click (event)
+  "Open the hyperlink at the mouse click EVENT position."
+  (interactive "e")
+  (let ((uri (get-text-property
+              (posn-point (event-start event))
+              'eat--t-hyperlink-uri)))
+    (if uri
+        (eat--open-hyperlink uri)
+      (user-error "No hyperlink at click position"))))
+
+(defun eat-open-hyperlink-at-point ()
+  "Open the hyperlink at point."
+  (interactive)
+  (let ((uri (get-text-property (point) 'eat--t-hyperlink-uri)))
+    (if uri
+        (eat--open-hyperlink uri)
+      (user-error "No hyperlink at point"))))
+
+(defun eat-copy-hyperlink-at-point ()
+  "Copy the hyperlink URI at point to the kill ring."
+  (interactive)
+  (let ((uri (get-text-property (point) 'eat--t-hyperlink-uri)))
+    (if uri
+        (progn
+          (kill-new uri)
+          (message "Copied: %s" uri))
+      (user-error "No hyperlink at point"))))
+
+(defun eat--hyperlink-first-occurrence-p (pos)
+  "Return non-nil if the hyperlink at POS is the first occurrence.
+For links with an `id', search up to one screen backward for an
+earlier segment with the same id and URI.  For links without an
+`id', check whether the immediately preceding hyperlink region
+has the same instance (i.e., from the same OSC 8 open/close run)."
+  (let ((id (get-text-property pos 'eat--t-hyperlink-id))
+        (uri (get-text-property pos 'eat--t-hyperlink-uri)))
+    (save-excursion
+      (goto-char pos)
+      (if id
+          ;; Id'd link: search within one screen for same (id . uri).
+          (let ((limit (max (point-min)
+                            (- pos (* (window-body-height)
+                                      (window-body-width)))))
+                (found-earlier nil))
+            (while (and (not found-earlier)
+                        (> (point) limit)
+                        (text-property-search-backward
+                         'eat--t-hyperlink-uri nil nil t))
+              (when (and (equal (get-text-property (point)
+                                                    'eat--t-hyperlink-id)
+                                 id)
+                          (equal (get-text-property (point)
+                                                    'eat--t-hyperlink-uri)
+                                 uri))
+                (setq found-earlier t)))
+            (not found-earlier))
+        ;; No id: check if the previous hyperlink region has the same
+        ;; instance, meaning it came from the same OSC 8 open/close.
+        (let ((instance (get-text-property pos 'eat--t-hyperlink-instance))
+              (prev (text-property-search-backward
+                     'eat--t-hyperlink-uri nil nil t)))
+          (not (and prev
+                    (eql (get-text-property (point)
+                                            'eat--t-hyperlink-instance)
+                         instance))))))))
+
+(defun eat-next-hyperlink ()
+  "Move point to the next hyperlink.
+Segments sharing the same `id' and URI are treated as one link;
+only the first occurrence is a tab stop."
+  (interactive)
+  (require 'text-property-search)
+  (let ((orig (point))
+        (match nil)
+        result-match)
+    (while (and (setq match (text-property-search-forward
+                              'eat--t-hyperlink-uri nil nil t))
+                (not (eat--hyperlink-first-occurrence-p
+                      (prop-match-beginning match)))))
+    (setq result-match
+          (and match
+               (eat--hyperlink-first-occurrence-p
+                (prop-match-beginning match))
+               match))
+    (if (not result-match)
+        (progn
+          (goto-char orig)
+          (message "No next hyperlink"))
+      (goto-char (prop-match-beginning result-match))
+      (message "%s" (get-text-property (point) 'help-echo)))))
+
+(declare-function text-property-search-backward "text-property-search")
+
+(defun eat-previous-hyperlink ()
+  "Move point to the previous hyperlink.
+Segments sharing the same `id' and URI are treated as one link;
+only the first occurrence is a tab stop."
+  (interactive)
+  (require 'text-property-search)
+  (let ((orig (point))
+        result-pos)
+    (while (and (text-property-search-backward
+                 'eat--t-hyperlink-uri nil nil nil)
+                (not (eat--hyperlink-first-occurrence-p (point)))))
+    (setq result-pos
+          (and (get-text-property (point) 'eat--t-hyperlink-uri)
+               (/= (point) orig)
+               (eat--hyperlink-first-occurrence-p (point))
+               (point)))
+    (if (not result-pos)
+        (progn
+          (goto-char orig)
+          (message "No previous hyperlink"))
+      (goto-char result-pos)
+      (message "%s" (get-text-property (point) 'help-echo)))))
+
+(defvar eat-hyperlink-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'eat-open-hyperlink-at-click)
+    (define-key map [mouse-2] #'eat-open-hyperlink-at-click)
+    (define-key map [?\C-m] #'eat-open-hyperlink-at-point)
+    (define-key map [?u] #'eat-copy-hyperlink-at-point)
+    map)
+  "Keymap for clickable hyperlinks in Eat buffers.")
+
+(defun eat--t-add-hyperlink-props (str len uri id instance)
+  "Add hyperlink text properties to STR of length LEN.
+URI is the hyperlink target, ID is the optional grouping id,
+and INSTANCE distinguishes separate OSC 8 open/close runs."
+  (put-text-property 0 len 'eat--t-hyperlink-uri uri str)
+  (put-text-property 0 len 'eat--t-hyperlink-instance instance str)
+  (put-text-property 0 len 'help-echo uri str)
+  (put-text-property 0 len 'mouse-face 'highlight str)
+  (put-text-property 0 len 'keymap eat-hyperlink-map str)
+  (when id
+    (put-text-property 0 len 'eat--t-hyperlink-id id str)))
+
 (defun eat--t-write (str &optional beg end)
   "Write STR from BEG to END on display."
   (setq beg (or beg 0))
@@ -1726,6 +1886,9 @@ character to actually show.")
           (alist-get (car (eat--t-term-charset eat--t-term))
                      (cdr (eat--t-term-charset eat--t-term))))
          (face (eat--t-face-face (eat--t-term-face eat--t-term)))
+         (hyperlink-uri (eat--t-term-hyperlink-uri eat--t-term))
+         (hyperlink-id (eat--t-term-hyperlink-id eat--t-term))
+         (hyperlink-instance (eat--t-term-hyperlink-instance eat--t-term))
          ;; Alist of indices and width of multi-column characters.
          (multi-col-char-indices nil)
          (inserted-till beg))
@@ -1786,6 +1949,11 @@ character to actually show.")
                    (put-text-property 0 (length s) 'face face s)
                    (put-text-property
                     0 (length s) 'font-lock-face face s)
+                   ;; Add hyperlink properties.
+                   (when hyperlink-uri
+                     (eat--t-add-hyperlink-props
+                      s (length s) hyperlink-uri hyperlink-id
+                      hyperlink-instance))
                    (insert s))
                  (setq inserted-till e)
                  (if (or (null next-multi-col)
@@ -1798,21 +1966,36 @@ character to actually show.")
                    ;; Kitty and St seems to ignore them, so we too.
                    (if (zerop (cdr next-multi-col))
                        (cl-incf inserted-till)
-                     (insert
-                      ;; Make sure the multi-column character
-                      ;; occupies the same number of characters as
-                      ;; its width.
-                      (propertize
-                       (make-string (1- (cdr next-multi-col)) ?\s)
-                       'invisible t 'face face 'font-lock-face face
-                       'eat--t-invisible-space t
-                       'eat--t-char-width (cdr next-multi-col))
-                      ;; Now insert the multi-column character.
-                      (propertize
-                       (substring str inserted-till
-                                  (cl-incf inserted-till))
-                       'face face 'font-lock-face face
-                       'eat--t-char-width (cdr next-multi-col))))
+                     (let (;; Make sure the multi-column character
+                           ;; occupies the same number of characters
+                           ;; as its width.
+                           (invis
+                            (propertize
+                             (make-string
+                              (1- (cdr next-multi-col)) ?\s)
+                             'invisible t 'face face
+                             'font-lock-face face
+                             'eat--t-invisible-space t
+                             'eat--t-char-width
+                             (cdr next-multi-col)))
+                           ;; Now insert the multi-column character.
+                           (cell
+                            (propertize
+                             (substring str inserted-till
+                                        (cl-incf inserted-till))
+                             'face face 'font-lock-face face
+                             'eat--t-char-width
+                             (cdr next-multi-col))))
+                       (when hyperlink-uri
+                         (eat--t-add-hyperlink-props
+                          invis (length invis)
+                          hyperlink-uri hyperlink-id
+                          hyperlink-instance)
+                         (eat--t-add-hyperlink-props
+                          cell (length cell)
+                          hyperlink-uri hyperlink-id
+                          hyperlink-instance))
+                       (insert invis cell)))
                    (setf multi-col-char-indices
                          (cdr multi-col-char-indices))
                    (write (- max wrote (cdr next-multi-col))
@@ -2897,6 +3080,22 @@ MODE should be one of nil and `x10', `normal', `button-event',
       (funcall (eat--t-term-set-cwd-fn eat--t-term)
                eat--t-term host dir))))
 
+(defun eat--t-set-hyperlink (params uri)
+  "Set or clear the current hyperlink.
+PARAMS is the colon-separated parameter string, URI is the target."
+  (if (string-empty-p uri)
+      ;; Close hyperlink.
+      (setf (eat--t-term-hyperlink-uri eat--t-term) nil
+            (eat--t-term-hyperlink-id eat--t-term) nil)
+    ;; Open hyperlink.  Extract id from params if present.
+    (let ((id nil))
+      (dolist (param (split-string params ":" t))
+        (when (string-match "\\`id=\\(.*\\)\\'" param)
+          (setq id (match-string 1 param))))
+      (setf (eat--t-term-hyperlink-uri eat--t-term) uri
+            (eat--t-term-hyperlink-id eat--t-term) id)
+      (cl-incf (eat--t-term-hyperlink-instance eat--t-term)))))
+
 (defun eat--t-send-device-attrs (n format)
   "Return device attributes.
 
@@ -3556,6 +3755,8 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
       ('ui-cmd (eat--t-ui-cmd (aref action 1)))
       ('manipulate-selection (eat--t-manipulate-selection (aref action 1)
                                                           (aref action 2)))
+      ('set-hyperlink (eat--t-set-hyperlink (aref action 1)
+                                            (aref action 2)))
       ;; Sixel.
       ('sixel-init (eat--t-sixel-init))
       ('sixel-write (eat--t-sixel-write (aref action 1) (aref action 2)
@@ -4032,6 +4233,16 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                            string-end)
                        (push (vector 'manipulate-selection
                                      targets data) actions)
+                       (cl-incf action-count))
+                      ;; OSC 8 ; <params> ; <uri> ST.
+                      ((rx string-start "8;"
+                           (let params
+                             (zero-or-more (not (any ?\;))))
+                           ?\;
+                           (let uri (zero-or-more anything))
+                           string-end)
+                       (push (vector 'set-hyperlink params uri)
+                             actions)
                        (cl-incf action-count))))))))))
         (`(read-dcs-params ,next-state ,params)
          ;; There is no standard format of device control strings, but
@@ -6205,6 +6416,28 @@ EVENT is the mouse event."
 This ensures Eat's semi-char and char mode keymaps take priority
 over all other minor mode keymaps (e.g., undo-tree-mode).")
 
+(defvar eat--hyperlink-nav-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [?\t] #'eat-next-hyperlink)
+    (define-key map [backtab] #'eat-previous-hyperlink)
+    map)
+  "Keymap for hyperlink navigation in Eat emacs mode.")
+
+(define-minor-mode eat--hyperlink-nav-mode
+  "Minor mode for navigating between hyperlinks in the terminal output.
+
+\\{eat--hyperlink-nav-mode-map}"
+  :interactive nil
+  :keymap eat--hyperlink-nav-mode-map
+  (setq minor-mode-overriding-map-alist
+        (delete (cons #'eat--hyperlink-nav-mode
+                      eat--hyperlink-nav-mode-map)
+                minor-mode-overriding-map-alist))
+  (when eat--hyperlink-nav-mode
+    (push (cons #'eat--hyperlink-nav-mode
+                eat--hyperlink-nav-mode-map)
+          minor-mode-overriding-map-alist)))
+
 (define-minor-mode eat--semi-char-mode
   "Minor mode for semi-char mode keymap."
   :interactive nil
@@ -6258,6 +6491,7 @@ Used when returning to semi-char or char mode."
   (eat--line-mode-exit)
   (eat--semi-char-mode -1)
   (eat--char-mode -1)
+  (eat--hyperlink-nav-mode +1)
   (setq buffer-read-only t)
   (eat--ensure-cursor-visible)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
@@ -6271,6 +6505,7 @@ Used when returning to semi-char or char mode."
   (setq buffer-read-only nil)
   (eat--line-mode-exit)
   (eat--char-mode -1)
+  (eat--hyperlink-nav-mode -1)
   (eat--semi-char-mode +1)
   (eat--restore-terminal-cursor)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
@@ -6284,6 +6519,7 @@ Used when returning to semi-char or char mode."
   (setq buffer-read-only nil)
   (eat--line-mode-exit)
   (eat--semi-char-mode -1)
+  (eat--hyperlink-nav-mode -1)
   (eat--char-mode +1)
   (eat--restore-terminal-cursor)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
@@ -6364,6 +6600,7 @@ MODE should one of:
   (eat--line-mode +1)
   (eat--semi-char-mode -1)
   (eat--char-mode -1)
+  (eat--hyperlink-nav-mode -1)
   (eat--grab-mouse nil eat--mouse-grabbing-type)
   (setq buffer-read-only nil)
   (eat--ensure-cursor-visible)
@@ -8836,6 +9073,53 @@ N defaults to 1.  Interactively, N is the prefix argument."
     (load (string-remove-suffix ".elc" eat--load-file-path))))
 
 (setq eat--being-loaded nil)
+
+;;;; Link-hint integration.
+
+(defun eat--link-hint-next-hyperlink (bound)
+  "Find the next Eat hyperlink from point up to BOUND for link-hint.
+Segments sharing the same `id' and URI are treated as one link."
+  (require 'text-property-search)
+  (let ((start (point)))
+    (save-excursion
+      (let ((limit (or bound (point-max)))
+            (match nil)
+            pos)
+        (while (and (setq match (text-property-search-forward
+                                  'eat--t-hyperlink-uri nil nil t))
+                    (setq pos (prop-match-beginning match))
+                    (< pos limit)
+                    (not (eat--hyperlink-first-occurrence-p pos))))
+        (when (and pos
+                   (>= pos start)
+                   (< pos limit)
+                   (eat--hyperlink-first-occurrence-p pos))
+          pos)))))
+
+(defun eat--link-hint-hyperlink-at-point-p ()
+  "Return the hyperlink URI at point, or nil."
+  (get-text-property (point) 'eat--t-hyperlink-uri))
+
+(defun eat--link-hint-open-hyperlink (uri)
+  "Open hyperlink URI via `eat--open-hyperlink'."
+  (eat--open-hyperlink uri))
+
+(defun eat--link-hint-copy-hyperlink (uri)
+  "Copy hyperlink URI to the kill ring."
+  (kill-new uri)
+  (message "Copied: %s" uri))
+
+(defvar link-hint-types)
+(declare-function link-hint-define-type "link-hint")
+
+(with-eval-after-load 'link-hint
+  (link-hint-define-type 'eat-hyperlink
+    :next #'eat--link-hint-next-hyperlink
+    :at-point-p #'eat--link-hint-hyperlink-at-point-p
+    :open #'eat--link-hint-open-hyperlink
+    :copy #'eat--link-hint-copy-hyperlink
+    :vars '(eat-mode eat-eshell-mode))
+  (add-to-list 'link-hint-types 'link-hint-eat-hyperlink))
 
 (provide 'eat)
 ;;; eat.el ends here

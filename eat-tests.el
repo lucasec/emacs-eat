@@ -6249,5 +6249,93 @@ default."
            ((mouse-movement ,(make-posn :col 90 :row 40))
             ,(make-posn :col 82 :row 33) "")))))))
 
+
+;;;;; OSC 8 Hyperlink Tests.
+
+(ert-deftest eat-test-osc8-basic-hyperlink ()
+  "Test basic OSC 8 hyperlink."
+  (eat--tests-with-term '()
+    (output "\e]8;;https://example.com\e\\Link text\e]8;;\e\\")
+    (should-term :display '("Link text")
+                 :cursor '(1 . 10))
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "Link")
+    (backward-char)
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-uri)
+                   "https://example.com"))
+    (should (equal (get-text-property (point) 'help-echo)
+                   "https://example.com"))
+    (should (get-text-property (point) 'mouse-face))
+    (should (get-text-property (point) 'keymap))))
+
+(ert-deftest eat-test-osc8-hyperlink-with-id ()
+  "Test OSC 8 hyperlink with id parameter."
+  (eat--tests-with-term '()
+    (output "\e]8;id=mylink;https://example.com\e\\Link\e]8;;\e\\")
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "L")
+    (backward-char)
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-uri)
+                   "https://example.com"))
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-id)
+                   "mylink"))))
+
+(ert-deftest eat-test-osc8-switch-uri-without-close ()
+  "Test switching hyperlink URI without explicit close."
+  (eat--tests-with-term '()
+    (output "\e]8;;https://one.com\e\\first")
+    (output "\e]8;;https://two.com\e\\second\e]8;;\e\\")
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "fir")
+    (backward-char)
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-uri)
+                   "https://one.com"))
+    (search-forward "sec")
+    (backward-char)
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-uri)
+                   "https://two.com"))))
+
+(ert-deftest eat-test-osc8-sgr-reset-preserves-hyperlink ()
+  "Test that SGR reset does not clear hyperlink."
+  (eat--tests-with-term '()
+    (output "\e]8;;https://example.com\e\\\e[1mBold\e[0mNormal\e]8;;\e\\")
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "Normal")
+    (backward-char)
+    (should (equal (get-text-property (point) 'eat--t-hyperlink-uri)
+                   "https://example.com"))))
+
+(ert-deftest eat-test-osc8-terminal-reset-clears-hyperlink ()
+  "Test that terminal reset clears hyperlink state."
+  (eat--tests-with-term '()
+    (output "\e]8;;https://example.com\e\\\ecafter reset")
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "after")
+    (backward-char)
+    (should-not (get-text-property (point) 'eat--t-hyperlink-uri))))
+
+(ert-deftest eat-test-osc8-close-when-no-link ()
+  "Test that closing hyperlink when none is active is a no-op."
+  (eat--tests-with-term '()
+    (output "\e]8;;\e\\plain text")
+    (should-term :display '("plain text")
+                 :cursor '(1 . 11))
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "plain")
+    (backward-char)
+    (should-not (get-text-property (point) 'eat--t-hyperlink-uri))))
+
+(ert-deftest eat-test-osc8-no-props-outside-link ()
+  "Test that text outside hyperlink has no hyperlink properties."
+  (eat--tests-with-term '()
+    (output "before\e]8;;https://example.com\e\\link\e]8;;\e\\after")
+    (goto-char (eat-term-display-beginning (terminal)))
+    (search-forward "bef")
+    (backward-char)
+    (should-not (get-text-property (point) 'eat--t-hyperlink-uri))
+    (search-forward "aft")
+    (backward-char)
+    (should-not (get-text-property (point) 'eat--t-hyperlink-uri))))
+
 (provide 'eat-tests)
 ;;; eat-tests.el ends here
