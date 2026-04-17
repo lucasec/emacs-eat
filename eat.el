@@ -162,6 +162,16 @@ This is the default name used when running Eat."
   :group 'eat-term
   :group 'eat-ui)
 
+(defcustom eat-notification-function #'eat-notification-message
+  "Function to call when a terminal notification is received.
+The function is called with two arguments: TITLE (a string or nil)
+and BODY (a string).  Set to `ignore' to disable notifications."
+  :type '(choice (function-item eat-notification-message)
+                 (function-item eat-notification-message-and-bell)
+                 (function-item ignore)
+                 (function :tag "Custom function"))
+  :group 'eat-ui)
+
 (defcustom eat-enable-kill-from-terminal t
   "Non-nil means allow terminal program to add text to `kill-ring'.
 
@@ -3080,6 +3090,10 @@ MODE should be one of nil and `x10', `normal', `button-event',
       (funcall (eat--t-term-set-cwd-fn eat--t-term)
                eat--t-term host dir))))
 
+(defun eat--t-notify (title body)
+  "Handle a desktop notification with TITLE and BODY."
+  (funcall eat-notification-function title body))
+
 (defun eat--t-set-hyperlink (params uri)
   "Set or clear the current hyperlink.
 PARAMS is the colon-separated parameter string, URI is the target."
@@ -3757,6 +3771,7 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                                                           (aref action 2)))
       ('set-hyperlink (eat--t-set-hyperlink (aref action 1)
                                             (aref action 2)))
+      ('notify (eat--t-notify (aref action 1) (aref action 2)))
       ;; Sixel.
       ('sixel-init (eat--t-sixel-init))
       ('sixel-write (eat--t-sixel-write (aref action 1) (aref action 2)
@@ -4243,6 +4258,25 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                            string-end)
                        (push (vector 'set-hyperlink params uri)
                              actions)
+                       (cl-incf action-count))
+                      ;; OSC 9 ; 4 ; <st> ; <pr> ST — progress indicator.
+                      ;; Ignored (ConEmu/iTerm2 extension).
+                      ((rx string-start "9;4;" (zero-or-more anything)
+                           string-end))
+                      ;; OSC 9 ; <body> ST — notification.
+                      ((rx string-start "9;"
+                           (let body (zero-or-more anything))
+                           string-end)
+                       (push (vector 'notify nil body) actions)
+                       (cl-incf action-count))
+                      ;; OSC 777 ; notify ; <title> ; <body> ST.
+                      ((rx string-start "777;notify;"
+                           (let title
+                             (zero-or-more (not (any ?\;))))
+                           ?\;
+                           (let body (zero-or-more anything))
+                           string-end)
+                       (push (vector 'notify title body) actions)
                        (cl-incf action-count))))))))))
         (`(read-dcs-params ,next-state ,params)
          ;; There is no standard format of device control strings, but
@@ -5635,6 +5669,22 @@ selection, or nil if none."
 
 (defun eat--bell (_)
   "Ring the bell."
+  (ding t))
+
+(defun eat-notification-message (title body)
+  "Display a terminal notification in the echo area.
+TITLE is the notification title (may be nil), BODY is the text."
+  (if (and title (not (string-empty-p title)))
+      (message "%s [%s]: %s"
+               (propertize (buffer-name) 'face 'shadow)
+               (propertize title 'face 'bold)
+               body)
+    (message "%s: %s" (propertize (buffer-name) 'face 'shadow) body)))
+
+(defun eat-notification-message-and-bell (title body)
+  "Display a terminal notification in the echo area and ring the bell.
+TITLE is the notification title (may be nil), BODY is the text."
+  (eat-notification-message title body)
   (ding t))
 
 (defun eat--sixel-render-format ()
