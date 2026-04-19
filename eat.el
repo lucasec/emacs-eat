@@ -7207,23 +7207,22 @@ symbol `buffer', in which case the point of current buffer is set."
         (goto-char (eat-term-display-cursor eat-terminal))
       (with-selected-window window
         (set-window-point nil (eat-term-display-cursor eat-terminal))
-        ;; Only recenter when the cursor or the end of the terminal
-        ;; is not visible.  This avoids overriding the user's scroll
-        ;; position (e.g. padding at the bottom) while still
-        ;; scrolling when new output appears below the window.
-        (unless (and (pos-visible-in-window-p
-                      (eat-term-display-cursor eat-terminal))
-                     (pos-visible-in-window-p
-                      (eat-term-end eat-terminal)))
-          ;; Position the window so that all terminal content below
-          ;; the cursor is visible, and use any extra window space
-          ;; (when window is taller than terminal) for scrollback.
-          (recenter
-           (- (+ 1
-                 (how-many "\n" (eat-term-display-cursor eat-terminal)
-                           (eat-term-end eat-terminal))
-                 (max 0 (- (floor (window-screen-lines))
-                           (cdr (eat-term-size eat-terminal))))))))))))
+        ;; Only recenter when the cursor is not visible, or when
+        ;; the window is tall enough to show the full terminal but
+        ;; the terminal end is not visible.  This avoids overriding
+        ;; the scroll position in windows shorter than the terminal,
+        ;; where the terminal end can never be visible when the
+        ;; cursor is near the top.
+        (let* ((cursor (eat-term-display-cursor eat-terminal))
+               (cursor-vis (pos-visible-in-window-p cursor))
+               (end-vis (pos-visible-in-window-p
+                         (eat-term-end eat-terminal)))
+               (short-win (< (floor (window-screen-lines))
+                             (cdr (eat-term-size eat-terminal)))))
+          (unless (and cursor-vis (or short-win end-vis))
+            (recenter
+             (- (1+ (how-many "\n" cursor
+                              (eat-term-end eat-terminal)))))))))))
 
 (defun eat--setup-glyphless-chars ()
   "Setup the display of glyphless characters."
