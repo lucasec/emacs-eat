@@ -7180,6 +7180,55 @@ Go to the history element by the absolute history position HIST-POS."
 
 ;;;;; Major Mode.
 
+;; Persist the window sentinel along with window configurations. This
+;; allows packages that save/restore the window configuration to track
+;; and restore whether the window was tracking the terminal cursor.
+(add-to-list 'window-persistent-parameters '(eat--sentinels . writable))
+
+(defun eat--window-sentinel-position (window)
+  "Return the sentinel position for the current buffer in WINDOW, or nil.
+The sentinel rides alongside the terminal cursor, every time the window
+point is synced to the cursor position. The window point and sentinel
+can be compared to determine if the user has moved the point away from
+the cursor position, e.g. to read the scrollback."
+  (let ((entry (assq (current-buffer)
+                     (window-parameter window 'eat--sentinels))))
+    (and entry (marker-position (cdr entry)))))
+
+(defun eat--set-window-sentinel (window pos)
+  "Record POS as WINDOW's sentinel for the current buffer.
+
+POS can be either a marker or an integer. The sentinel is always
+normalized and stored as a marker."
+  (let* ((alist (window-parameter window 'eat--sentinels))
+         (entry (assq (current-buffer) alist))
+         ;; Normalize POS to an integer for comparison
+         (pos (if (markerp pos) (marker-position pos) pos)))
+    (unless (and entry (eql (marker-position (cdr entry)) pos))
+      ;; Create a new marker for POS and a new hash for storage. Do
+      ;; not mutate either in place, as these are shallow-copied by
+      ;; packages that save/restore window configurations.
+      (let ((new-entry (cons (current-buffer)
+                             (copy-marker pos window-point-insertion-type)))
+            (rest nil))
+        (dolist (e alist)
+          (when (and (not (eq (car e) (current-buffer)))
+                     (buffer-live-p (car e)))
+            (push e rest)))
+        (set-window-parameter window 'eat--sentinels
+                              (cons new-entry rest))))))
+
+(defun eat--window-tracking-p (window)
+  "Non-nil if WINDOW's point indicates it is tracking the cursor.
+
+A window is considered tracking when its point matches either the
+sentinel (last synced position) or the current terminal cursor."
+  (let ((sp (eat--window-sentinel-position window))
+        (wp (window-point window))
+        (cursor (eat-term-display-cursor eat-terminal)))
+    (or (= wp cursor)
+        (and sp (= sp wp)))))
+
 (defun eat--synchronize-scroll-windows (&optional force-selected)
   "Return the list of windows whose scrolling should be synchronized.
 
@@ -7193,9 +7242,8 @@ buffer."
     ,@(seq-filter
        (lambda (window)
          (or (and force-selected (eq window (selected-window)))
-             (= (eat-term-display-cursor eat-terminal)
-                (window-point window))))
-       (get-buffer-window-list))))
+             (eat--window-tracking-p window)))
+       (get-buffer-window-list nil nil t))))
 
 (defun eat--synchronize-scroll (windows)
   "Synchronize scrolling and point between terminal and WINDOWS.
@@ -7206,23 +7254,24 @@ symbol `buffer', in which case the point of current buffer is set."
     (if (eq window 'buffer)
         (goto-char (eat-term-display-cursor eat-terminal))
       (with-selected-window window
-        (set-window-point nil (eat-term-display-cursor eat-terminal))
-        ;; Only recenter when the cursor is not visible, or when
-        ;; the window is tall enough to show the full terminal but
-        ;; the terminal end is not visible.  This avoids overriding
-        ;; the scroll position in windows shorter than the terminal,
-        ;; where the terminal end can never be visible when the
-        ;; cursor is near the top.
-        (let* ((cursor (eat-term-display-cursor eat-terminal))
-               (cursor-vis (pos-visible-in-window-p cursor))
-               (end-vis (pos-visible-in-window-p
-                         (eat-term-end eat-terminal)))
-               (short-win (< (floor (window-screen-lines))
-                             (cdr (eat-term-size eat-terminal)))))
-          (unless (and cursor-vis (or short-win end-vis))
-            (recenter
-             (- (1+ (how-many "\n" cursor
-                              (eat-term-end eat-terminal)))))))))))
+        (let ((cursor (eat-term-display-cursor eat-terminal)))
+          (set-window-point nil cursor)
+          (eat--set-window-sentinel window cursor)
+          ;; Only recenter when the cursor is not visible, or when the
+          ;; window is tall enough to show the full terminal but the
+          ;; terminal end is not visible.  This avoids overriding the
+          ;; scroll position in windows shorter than the terminal,
+          ;; where the terminal end can never be visible when the
+          ;; cursor is near the top.
+          (let ((cursor-vis (pos-visible-in-window-p cursor))
+                (end-vis (pos-visible-in-window-p
+                          (eat-term-end eat-terminal)))
+                (short-win (< (floor (window-screen-lines))
+                              (cdr (eat-term-size eat-terminal)))))
+            (unless (and cursor-vis (or short-win end-vis))
+              (recenter
+               (- (1+ (how-many "\n" cursor
+                                (eat-term-end eat-terminal))))))))))))
 
 (defun eat--setup-glyphless-chars ()
   "Setup the display of glyphless characters."
@@ -8353,14 +8402,15 @@ symbol `buffer', in which case the point of current buffer is set."
     (if (eq window 'buffer)
         (goto-char (eat-term-display-cursor eat-terminal))
       (with-selected-window window
-        (set-window-point nil (eat-term-display-cursor eat-terminal))
-        (unless (and (pos-visible-in-window-p
-                      (eat-term-display-cursor eat-terminal))
-                     (pos-visible-in-window-p
-                      (eat-term-end eat-terminal)))
-          (recenter
-           (- (1+ (how-many "\n" (eat-term-display-cursor eat-terminal)
-                            (eat-term-end eat-terminal))))))))))
+        (let ((cursor (eat-term-display-cursor eat-terminal)))
+          (set-window-point nil cursor)
+          (eat--set-window-sentinel window cursor)
+          (unless (and (pos-visible-in-window-p cursor)
+                       (pos-visible-in-window-p
+                        (eat-term-end eat-terminal)))
+            (recenter
+             (- (1+ (how-many "\n" cursor
+                              (eat-term-end eat-terminal)))))))))))
 
 (defun eat--eshell-update-cwd ()
   "Update the current working directory."
