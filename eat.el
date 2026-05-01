@@ -2613,9 +2613,8 @@ position."
          (scroll-begin (eat--t-term-scroll-begin eat--t-term))
          (scroll-end (eat--t-term-scroll-end eat--t-term)))
     ;; N should be positive and shouldn't exceed the number of lines
-    ;; below cursor position and inside current scroll region.
-    (setq n (min (- (1+ (- scroll-end scroll-begin))
-                    (1- (eat--t-cur-y cursor)))
+    ;; from cursor through end of scroll region.
+    (setq n (min (1+ (- scroll-end (eat--t-cur-y cursor)))
                  (max (or n 1) 1)))
     ;; Make sure we are in the scroll region and N is positive, return
     ;; on failure.
@@ -2666,10 +2665,8 @@ position."
          (scroll-begin (eat--t-term-scroll-begin eat--t-term))
          (scroll-end (eat--t-term-scroll-end eat--t-term)))
     ;; N should be positive and shouldn't exceed the number of
-    ;; lines below cursor position and inside current scroll
-    ;; region.
-    (setq n (min (- (1+ (- scroll-end scroll-begin))
-                    (1- (eat--t-cur-y cursor)))
+    ;; lines from cursor through end of scroll region.
+    (setq n (min (1+ (- scroll-end (eat--t-cur-y cursor)))
                  (max (or n 1) 1)))
     ;; Make sure we are in the scroll region and N is positive, return
     ;; on failure.

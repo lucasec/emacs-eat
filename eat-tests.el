@@ -145,7 +145,7 @@ will return t."
              (and (visually-equal
                    a (substring b 0 (length a)))
                   (let ((str (substring b (length a))))
-                    (and (string-blank-p str)
+                    (and (should (string-blank-p str))
                          (visually-equal
                           str (eat--tests-parse-text-properties
                                (substring-no-properties str)))))))
@@ -153,7 +153,7 @@ will return t."
              (and (visually-equal
                    (substring a 0 (length b)) b)
                   (let ((str (substring a (length b))))
-                    (and (string-blank-p str)
+                    (and (should (string-blank-p str))
                          (visually-equal
                           str (eat--tests-parse-text-properties
                                (substring-no-properties str)))))))))))
@@ -191,7 +191,8 @@ will return t."
           (lambda (i)
             (let ((actual (or (nth i display) ""))
                   (expected (or (nth i lines) "")))
-              (and (<= (length actual) (car (eat-term-size terminal)))
+              (and (should (<= (length actual)
+                               (car (eat-term-size terminal))))
                    (eat--tests-compare-lines actual expected))))
           (number-sequence 0 (1- (cdr (eat-term-size terminal))))))))
 
@@ -5055,6 +5056,58 @@ automatic scrolling as a side effect."
                   '((0 . 20)
                     :background "#646432")))
      :cursor '(1 . 1))))
+
+(ert-deftest eat-test-insert-line-scroll-region ()
+  "Test insert line with a non-default scroll region."
+  (eat--tests-with-term '()
+    ;; Scroll region [3,6], cursor at row 5.
+    (output "line 1\nline 2\nline 3\nline 4\nline 5\nline 6"
+            "\e[3;6r\e[5;1H\e[L")
+    (should-term :display '("line 1"
+                            "line 2"
+                            "line 3"
+                            "line 4"
+                            ""
+                            "line 5")
+                 :cursor '(5 . 1))
+    ;; Reset and redraw.
+    (output "\e[r\e[2J\e[H"
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6")
+    ;; Scroll region [3,6], cursor at row 4, insert 5 lines.
+    (output "\e[3;6r\e[4;1H\e[5L")
+    (should-term :display '("line 1"
+                            "line 2"
+                            "line 3"
+                            ""
+                            ""
+                            "")
+                 :cursor '(4 . 1))))
+
+(ert-deftest eat-test-delete-line-scroll-region ()
+  "Test delete line with a non-default scroll region."
+  (eat--tests-with-term '()
+    ;; Scroll region [2,5], cursor at row 4, delete 2 lines
+    (output "line 1\nline 2\nline 3\nline 4\nline 5\nline 6"
+            "\e[2;5r\e[4;1H\e[2M")
+    (should-term :display '("line 1"
+                            "line 2"
+                            "line 3"
+                            ""
+                            ""
+                            "line 6")
+                 :cursor '(4 . 1))
+    ;; Reset and redraw.
+    (output "\e[r\e[2J\e[H"
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6")
+    ;; Scroll region [2,5], cursor at row 5, delete 1 line.
+    (output "\e[2;5r\e[5;1H\e[M")
+    (should-term :display '("line 1"
+                            "line 2"
+                            "line 3"
+                            "line 4"
+                            ""
+                            "line 6")
+                 :cursor '(5 . 1))))
 
 (ert-deftest eat-test-erase-in-line ()
   "Test erase in line control function."
