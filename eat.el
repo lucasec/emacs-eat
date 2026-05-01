@@ -8212,6 +8212,19 @@ FN, `eat-exec', which see."
           (eat--trace-log time 'create 'eat width height
                           variables))))))
 
+(defun eat--trace-filter (fn process output)
+  "Trace `eat--filter'.
+
+PROCESS and OUTPUT are passed to FN, `eat--filter'. Logs the raw OUTPUT
+string before parsing so that replay can feed it back through
+`eat-term-process-output'."
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (when (buffer-live-p eat--trace-output-buffer)
+        (with-current-buffer eat--trace-output-buffer
+          (eat--trace-log nil 'output output)))))
+  (funcall fn process output))
+
 (defun eat--trace-process-output-queue (fn buffer)
   "Trace `eat--process-output-queue'.
 
@@ -8219,15 +8232,7 @@ BUFFER is passed to FN, `eat--process-output-queue', which see."
   (if (or (not (buffer-live-p buffer))
           (not (buffer-local-value 'eat--trace-output-buffer buffer)))
       (funcall fn buffer)
-    (cl-letf* ((eat-term-process-output
-                (symbol-function #'eat-term-process-output))
-               ((symbol-function #'eat-term-process-output)
-                (lambda (terminal output)
-                  (when (buffer-live-p eat--trace-output-buffer)
-                    (with-current-buffer eat--trace-output-buffer
-                      (eat--trace-log nil 'output output)))
-                  (funcall eat-term-process-output terminal output)))
-               (eat-term-redisplay
+    (cl-letf* ((eat-term-redisplay
                 (symbol-function #'eat-term-redisplay))
                ((symbol-function #'eat-term-redisplay)
                 (lambda (terminal)
@@ -8338,6 +8343,36 @@ see."
                                     variables)))))))))
     (apply fn args)))
 
+(defun eat--trace-eshell-filter (fn process string)
+  "Trace `eat--eshell-filter'.
+
+PROCESS and STRING are passed to FN. Logs the raw STRING before parsing
+so that replay can feed it back through `eat-term-process-output'."
+  (when (buffer-live-p (process-buffer process))
+    (with-current-buffer (process-buffer process)
+      (when (buffer-live-p eat--trace-output-buffer)
+        (with-current-buffer eat--trace-output-buffer
+          (eat--trace-log nil 'output string)))))
+  (funcall fn process string))
+
+(defun eat--trace-eshell-process-output-queue (fn buffer)
+  "Trace `eat--eshell-process-output-queue'.
+
+BUFFER is passed to FN, `eat--eshell-process-output-queue'. We capture
+the redisplay event here, output is captured in filter."
+  (if (or (not (buffer-live-p buffer))
+          (not (buffer-local-value 'eat--trace-output-buffer buffer)))
+      (funcall fn buffer)
+    (cl-letf* ((eat-term-redisplay
+                (symbol-function #'eat-term-redisplay))
+               ((symbol-function #'eat-term-redisplay)
+                (lambda (terminal)
+                  (when (buffer-live-p eat--trace-output-buffer)
+                    (with-current-buffer eat--trace-output-buffer
+                      (eat--trace-log nil 'redisplay)))
+                  (funcall eat-term-redisplay terminal))))
+      (funcall fn buffer))))
+
 (defun eat--trace-eshell-cleanup (fn)
   "Trace `eat--eshell-cleanup'.
 
@@ -8359,6 +8394,7 @@ FN is the original definition of `eat--eshell-cleanup', which see."
   (if eat-trace-mode
       (progn
         (advice-add #'eat-exec :around #'eat--trace-exec)
+        (advice-add #'eat--filter :around #'eat--trace-filter)
         (advice-add #'eat--process-output-queue :around
                     #'eat--trace-process-output-queue)
         (advice-add #'eat--adjust-process-window-size :around
@@ -8367,9 +8403,14 @@ FN is the original definition of `eat--eshell-cleanup', which see."
         (advice-add #'eat-reset :around #'eat--trace-reset)
         (advice-add #'eat--eshell-adjust-make-process-args :around
                     #'eat--trace-eshell-adjust-make-process-args)
+        (advice-add #'eat--eshell-filter :around
+                    #'eat--trace-eshell-filter)
+        (advice-add #'eat--eshell-process-output-queue :around
+                    #'eat--trace-eshell-process-output-queue)
         (advice-add #'eat--eshell-cleanup :around
                     #'eat--trace-eshell-cleanup))
     (advice-remove #'eat-exec #'eat--trace-exec)
+    (advice-remove #'eat--filter #'eat--trace-filter)
     (advice-remove #'eat--process-output-queue
                    #'eat--trace-process-output-queue)
     (advice-remove #'eat--adjust-process-window-size
@@ -8378,6 +8419,10 @@ FN is the original definition of `eat--eshell-cleanup', which see."
     (advice-remove #'eat-reset #'eat--trace-reset)
     (advice-remove #'eat--eshell-adjust-make-process-args
                    #'eat--trace-eshell-adjust-make-process-args)
+    (advice-remove #'eat--eshell-filter
+                   #'eat--trace-eshell-filter)
+    (advice-remove #'eat--eshell-process-output-queue
+                   #'eat--trace-eshell-process-output-queue)
     (advice-remove #'eat--eshell-cleanup
                    #'eat--trace-eshell-cleanup)
     (dolist (buffer (buffer-list))
