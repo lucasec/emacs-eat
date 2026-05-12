@@ -1885,6 +1885,178 @@ and INSTANCE distinguishes separate OSC 8 open/close runs."
   (when id
     (put-text-property 0 len 'eat--t-hyperlink-id id str)))
 
+(defvar-local eat--t-wide-char-width-cache nil
+  "Hash table caching pin decisions for wide characters.
+Keys are `(char face frame-char-w . frame-char-h)'; values are
+the cons `(CELL-FACE . COMPANION-WIDTH)' returned by
+`eat--t-pin-wide-char'.  Including frame metrics in the key means
+a font size change automatically generates fresh entries without
+manual invalidation.  Lazily initialized in
+`eat--t-pin-wide-char'.")
+
+(defun eat--t-measure-glyph (char face)
+  "Return `(WIDTH . HEIGHT)' in pixels for CHAR rendered with FACE.
+Inserts the propertized character plus surrounding newlines into the
+current buffer at `point-max', measures via `window-text-pixel-size'
+on a live window displaying the buffer, and rolls back the insertion.
+Returns nil when the buffer isn't displayed in any window."
+  (let ((win (get-buffer-window (current-buffer) t)))
+    (when win
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (buffer-undo-list t))
+        (save-excursion
+          (goto-char (point-max))
+          (let ((start (point)))
+            (unwind-protect
+                (progn
+                  (insert "\n" (propertize (string char) 'face face) "\n")
+                  ;; Measure only the middle line (skip the leading
+                  ;; newline); trailing newline terminates the line
+                  ;; so its height is reported.
+                  (let ((size (window-text-pixel-size
+                               win (1+ start) (point))))
+                    (cons (car size) (cdr size))))
+              (delete-region start (point-max)))))))))
+
+(defun eat--t-pin-wide-char (char face width)
+  "Compute display adjustments to pin CHAR to WIDTH cells of space.
+FACE is the base face applied to CHAR.  The returned adjustments
+make CHAR render at no more than `WIDTH * frame-char-width' pixels
+wide and no more than `frame-char-height' pixels tall, so both
+column alignment and line height stay stable even when fallback
+fonts produce oversized glyphs (emoji, CJK).
+
+Returns a cons (CELL-FACE . COMPANION-WIDTH):
+- CELL-FACE is the face to apply to the visible glyph.  Oversized
+  glyphs are scaled down via a stacked `(:height SCALE)' face.
+- COMPANION-WIDTH is the pixel width to enforce on the trailing
+  invisible-space companion cell via `display (space :width N)',
+  absorbing any residual gap left by bucket-snapping.
+
+Returns nil on non-graphical frames, on Emacs versions without
+`string-pixel-width' (< 29.1), or when the current buffer has no
+live window yet (e.g. during startup, before the terminal has been
+displayed) so it cannot measure reliably; callers fall back to the
+legacy always-invisible companion path."
+  (when (and (display-graphic-p)
+             (fboundp 'string-pixel-width)
+             (get-buffer-window (current-buffer) t))
+    (unless eat--t-wide-char-width-cache
+      (setq eat--t-wide-char-width-cache (make-hash-table :test 'equal)))
+    (let* ((key (list char face (frame-char-width) (frame-char-height)))
+           (cached (gethash key eat--t-wide-char-width-cache)))
+      (or cached
+          (let ((natural (eat--t-measure-glyph char face)))
+            (when natural
+              (let* ((nat-w (car natural))
+                     (nat-h (cdr natural))
+                     (target-w (* width (frame-char-width)))
+                     (target-h (frame-char-height))
+                     (result
+                      (if (and (<= nat-w target-w)
+                               (<= nat-h target-h))
+                          (cons face (- target-w nat-w))
+                        ;; Scale isotropically to fit both dimensions,
+                        ;; then ratchet down for bucket-snap overshoot.
+                        (let* ((scale (min (/ (float target-w) nat-w)
+                                           (/ (float target-h) nat-h)))
+                               (scaled-face
+                                (list (list :height scale) face))
+                               (measured
+                                (eat--t-measure-glyph char scaled-face))
+                               (tries 0))
+                          (while (and measured
+                                      (or (> (car measured) target-w)
+                                          (> (cdr measured) target-h))
+                                      (> scale 0.1)
+                                      (< tries 20))
+                            (setq scale (- scale 0.05))
+                            (setq scaled-face
+                                  (list (list :height scale) face))
+                            (setq measured
+                                  (eat--t-measure-glyph char scaled-face))
+                            (cl-incf tries))
+                          (cons scaled-face
+                                (if measured
+                                    (max 0 (- target-w (car measured)))
+                                  0))))))
+                (puthash key result eat--t-wide-char-width-cache))))))))
+
+(defun eat--t-apply-wide-char-pins (beg end)
+  "Apply width/height pins to wide characters between BEG and END.
+Scans the region for visible wide characters (those whose
+`eat--t-char-width' text property is > 1 and which lack the
+`eat--t-invisible-space' marker).  Each such character gets a
+scaled face (to fit `frame-char-height') and its trailing invisible
+companion cell gets a `display (space :width N)' spec (to pad any
+residual gap), so column alignment and line height stay stable
+regardless of fallback-font glyph metrics.
+
+Pins are marked with an `eat--t-pinned' property whose value is the
+current frame's cell metrics `(FRAME-CHAR-W . FRAME-CHAR-H)'.  If
+metrics change (font size/face change, window on a different frame),
+previously-pinned chars are re-pinned on the next call.
+
+No-op on non-graphical frames, pre-Emacs-29, or when the current
+buffer has no live window displaying it."
+  (when (and (display-graphic-p)
+             (fboundp 'string-pixel-width)
+             (get-buffer-window (current-buffer) t))
+    (let* ((inhibit-read-only t)
+           (inhibit-modification-hooks t)
+           (buffer-undo-list t)
+           (cur-metrics (cons (frame-char-width) (frame-char-height)))
+           (pos beg))
+      (while (and pos (< pos end))
+        (let ((char-width (get-text-property pos 'eat--t-char-width))
+              (invisible-space (get-text-property
+                                pos 'eat--t-invisible-space))
+              (pinned (get-text-property pos 'eat--t-pinned)))
+          (when (and char-width (> char-width 1) (not invisible-space)
+                     (not (equal pinned cur-metrics)))
+            (let* ((char (char-after pos))
+                   (face (get-text-property pos 'face))
+                   ;; If this is a re-pin (metrics changed), strip
+                   ;; the prior scaled face by recovering the
+                   ;; underlying base face.  Stacked faces have shape
+                   ;; `((:height N) BASE)'; plain faces don't.
+                   (base-face
+                    (if (and (consp face)
+                             (consp (car face))
+                             (eq (caar face) :height))
+                        (cadr face)
+                      face))
+                   (pin (eat--t-pin-wide-char char base-face char-width)))
+              (when pin
+                (let ((cell-face (car pin))
+                      (companion-w (cdr pin))
+                      ;; `eat--t-write' inserts the invisible-space
+                      ;; companion *before* the visible glyph, so the
+                      ;; companion sits at (1- pos).
+                      (companion-pos (1- pos)))
+                  (put-text-property pos (1+ pos) 'face cell-face)
+                  (put-text-property pos (1+ pos)
+                                     'font-lock-face cell-face)
+                  ;; Swap the last companion cell's `invisible t' for
+                  ;; a `display (space :width N)' spec so the residual
+                  ;; gap between the scaled glyph and target width is
+                  ;; rendered as explicit padding.  Any earlier
+                  ;; companions (rare, width > 2) stay invisible.
+                  (when (and (>= companion-pos beg)
+                             (get-text-property
+                              companion-pos
+                              'eat--t-invisible-space))
+                    (put-text-property
+                     companion-pos (1+ companion-pos)
+                     'display `(space :width (,companion-w)))
+                    (put-text-property
+                     companion-pos (1+ companion-pos)
+                     'invisible nil))
+                  (put-text-property pos (1+ pos)
+                                     'eat--t-pinned cur-metrics))))))
+        (setq pos (1+ pos))))))
+
 (defun eat--t-write (str &optional beg end)
   "Write STR from BEG to END on display."
   (setq beg (or beg 0))
@@ -7365,6 +7537,9 @@ to all terminals with mode 2031 enabled."
   (setq buffer-read-only nil)
   (setq scroll-margin 0)
   (setq hscroll-margin 0)
+  ;; Pin line height so fallback-font glyphs in animation frames
+  ;; (e.g. spinners) don't cause between-line jitter.
+  (setq-local line-spacing 0)
   (setq eat--synchronize-scroll-function #'eat--synchronize-scroll)
   (setq filter-buffer-substring-function
         #'eat--filter-buffer-substring)
@@ -7616,7 +7791,10 @@ established any buffer-level protections it needs
              (eat-term-end eat-terminal)
              `( read-only t field eat-terminal
                 ,@(when eat--line-mode
-                    '(front-sticky t rear-nonsticky t))))))
+                    '(front-sticky t rear-nonsticky t))))
+            (eat--t-apply-wide-char-pins
+             (eat-term-display-beginning eat-terminal)
+             (eat-term-end eat-terminal))))
         (eat--line-mode-do-toggles)
         (funcall eat--synchronize-scroll-function sync-windows))
       (run-hooks 'eat-update-hook))))
@@ -8434,6 +8612,7 @@ symbol `buffer', in which case the point of current buffer is set."
       (mapc #'make-local-variable locals)
       (setq scroll-margin 0)
       (setq hscroll-margin 0)
+      (setq-local line-spacing 0)
       (setq eat--synchronize-scroll-function
             #'eat--eshell-synchronize-scroll)
       (setq filter-buffer-substring-function
