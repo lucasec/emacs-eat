@@ -1984,29 +1984,28 @@ legacy always-invisible companion path."
                 (puthash key result eat--t-wide-char-width-cache))))))))
 
 (defun eat--t-remove-pin-overlays (beg end)
-  "Remove all pin-padding overlays between BEG and END."
+  "Remove all pin overlays between BEG and END."
   (dolist (ov (overlays-in beg end))
-    (when (overlay-get ov 'eat--pin-padding)
+    (when (overlay-get ov 'eat--pin)
       (delete-overlay ov))))
 
 (defun eat--t-apply-wide-char-pins (beg end)
   "Apply width/height pins to oversized characters between BEG and END.
-Scans the region for visible characters that render from fallback
-fonts with metrics exceeding the frame's cell grid.  Each such
-character gets a scaled face (to fit `frame-char-height').  Width-2+
-chars also get a `display (space :width N)' spec on their trailing
-invisible companion cell to pad any residual gap.  Width-1 chars
-that undershoot their target width after scaling get an
-`after-string' overlay with a stretch glyph of the residual width,
-since they have no companion cell.
+Scans the region for visible non-ASCII characters whose fallback-font
+metrics exceed the frame's cell grid.  Each such character is pinned
+via a single overlay carrying:
+- A scaled `face' that constrains glyph height to `frame-char-height'.
+- Matching `before-string' and `after-string' stretch glyphs that
+  center any residual horizontal pad across the cell boundary, so
+  column alignment is preserved pixel-perfect.
+
+Width-2+ chars' invisible companion cells remain `invisible t' from
+`eat--t-write'; the overlay spans both the glyph and its companions,
+and the padding bridges the whole cell group.
 
 Measurement is skipped for pure ASCII (< 128) since those always
-render in the primary monospace font.
-
-Pins are marked with an `eat--t-pinned' property whose value is the
-current frame's cell metrics `(FRAME-CHAR-W . FRAME-CHAR-H)'.  If
-metrics change (font size/face change, window on a different frame),
-previously-pinned chars are re-pinned on the next call.
+render in the primary monospace font.  All pin state lives on the
+overlay; stripping overlays fully undoes a pin.
 
 No-op on non-graphical frames, pre-Emacs-29, or when the current
 buffer has no live window displaying it."
@@ -2016,79 +2015,62 @@ buffer has no live window displaying it."
     (let* ((inhibit-read-only t)
            (inhibit-modification-hooks t)
            (buffer-undo-list t)
-           (cur-metrics (cons (frame-char-width) (frame-char-height)))
            (pos beg))
-      ;; Strip stale padding overlays so we start from a clean slate.
-      ;; Cells may have been overwritten since the last drain, making
-      ;; old overlays point at unrelated content.
+      ;; Strip stale pin overlays so we start from a clean slate —
+      ;; cells may have been overwritten since the last drain.
       (eat--t-remove-pin-overlays beg end)
       (while (and pos (< pos end))
         (let ((char (char-after pos))
               (invisible-space (get-text-property
-                                pos 'eat--t-invisible-space))
-              (pinned (get-text-property pos 'eat--t-pinned)))
-          (when (and char
-                     (>= char 128)
-                     (not invisible-space))
+                                pos 'eat--t-invisible-space)))
+          (when (and char (>= char 128) (not invisible-space))
             (let* ((char-width (or (get-text-property
                                     pos 'eat--t-char-width)
                                    1))
                    (face (get-text-property pos 'face))
-                   ;; If this is a re-pin (metrics changed), strip
-                   ;; the prior scaled face by recovering the
-                   ;; underlying base face.  Stacked faces have shape
-                   ;; `((:height N) BASE)'; plain faces don't.
-                   (base-face
-                    (if (and (consp face)
-                             (consp (car face))
-                             (eq (caar face) :height))
-                        (cadr face)
-                      face))
-                   (pin (eat--t-pin-wide-char
-                         char base-face char-width)))
+                   (pin (eat--t-pin-wide-char char face char-width)))
               (when pin
-                (let ((cell-face (car pin))
-                      (pad-px (cdr pin))
-                      (needs-face-pin (not (equal pinned cur-metrics)))
-                      ;; `eat--t-write' inserts the invisible-space
-                      ;; companion *before* the visible glyph for
-                      ;; width-2+ chars, so it sits at (1- pos).
-                      (companion-pos (1- pos)))
-                  (when needs-face-pin
-                    (put-text-property pos (1+ pos) 'face cell-face)
-                    (put-text-property pos (1+ pos)
-                                       'font-lock-face cell-face)
-                    (put-text-property pos (1+ pos)
-                                       'eat--t-pinned cur-metrics))
-                  (cond
-                   ;; Width-2+: swap the last companion cell's
-                   ;; `invisible t' for a display spec that renders
-                   ;; exactly the residual padding pixels.  Applied
-                   ;; every drain (idempotent) since companions can
-                   ;; be overwritten by terminal redraws.
-                   ((and (> char-width 1)
-                         (>= companion-pos beg)
-                         (get-text-property
-                          companion-pos
-                          'eat--t-invisible-space))
-                    (put-text-property
-                     companion-pos (1+ companion-pos)
-                     'display `(space :width (,pad-px)))
-                    (put-text-property
-                     companion-pos (1+ companion-pos)
-                     'invisible nil))
-                   ;; Width-1 with residual undershoot: add an
-                   ;; after-string overlay of exactly pad-px pixels.
-                   ;; Re-created each drain since we strip all
-                   ;; padding overlays at the top of the scan.
-                   ((and (= char-width 1) (> pad-px 0))
-                    (let ((ov (make-overlay pos (1+ pos))))
-                      (overlay-put ov 'eat--pin-padding t)
-                      (overlay-put
-                       ov 'after-string
-                       (propertize
-                        " " 'display
-                        `(space :width (,pad-px))))))))))))
+                (let* ((cell-face (car pin))
+                       (pad-px (cdr pin))
+                       (scaled (not (eq cell-face face))))
+                  ;; Skip chars that need no adjustment (natural
+                  ;; metrics fit and face is unchanged).  Zero-pad
+                  ;; naturally-fitting chars would still create an
+                  ;; overlay with nothing to do.
+                  (when (or scaled (> pad-px 0))
+                    (let* (;; Split residual pad across both sides so
+                           ;; the glyph sits centered in its cell;
+                           ;; odd pads drop the extra pixel on the
+                           ;; trailing side.
+                           (lead-px (/ pad-px 2))
+                           (trail-px (- pad-px lead-px))
+                           ;; The overlay spans the visible glyph
+                           ;; plus its invisible companion cells
+                           ;; (width 1..N).  Companions sit *before*
+                           ;; the visible glyph in the buffer (see
+                           ;; `eat--t-write'), so the overlay extends
+                           ;; (char-width - 1) chars back.
+                           (ov-start (max beg (- pos (1- char-width))))
+                           (ov-end (1+ pos))
+                           (ov (make-overlay ov-start ov-end)))
+                      (overlay-put ov 'eat--pin t)
+                      ;; Low priority so region, hl-line, isearch, and
+                      ;; other user-visible highlights compose on top
+                      ;; of our scaled face instead of being shadowed.
+                      (overlay-put ov 'priority -100)
+                      (when scaled
+                        (overlay-put ov 'face cell-face))
+                      (when (> lead-px 0)
+                        (overlay-put
+                         ov 'before-string
+                         (propertize
+                          " " 'display `(space :width (,lead-px)))))
+                      (when (> trail-px 0)
+                        (overlay-put
+                         ov 'after-string
+                         (propertize
+                          " " 'display
+                          `(space :width (,trail-px))))))))))))
         (setq pos (1+ pos))))))
 
 (defun eat--t-write (str &optional beg end)
