@@ -2154,7 +2154,12 @@ nil when no pin is needed and EXISTING was deleted."
              (ov-start (max beg (- pos (1- char-width))))
              (ov-end (1+ pos))
              (ov (if cached-shape
-                     existing
+                     ;; Reusing the existing overlay; its bounds may
+                     ;; have shifted from buffer edits between drains
+                     ;; (eat aggressively `delete-region's during
+                     ;; redraws), so re-pin them to our intended span.
+                     (progn (move-overlay existing ov-start ov-end)
+                            existing)
                    (when existing (delete-overlay existing))
                    (make-overlay ov-start ov-end))))
         (overlay-put ov 'eat--pin t)
