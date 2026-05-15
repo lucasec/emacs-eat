@@ -1886,85 +1886,105 @@ and INSTANCE distinguishes separate OSC 8 open/close runs."
     (put-text-property 0 len 'eat--t-hyperlink-id id str)))
 
 (defvar-local eat--t-wide-char-width-cache nil
-  "Hash table caching pin decisions for wide characters.
-Keys are `(char face frame-char-w . frame-char-h)'; values are
-the cons `(CELL-FACE . COMPANION-WIDTH)' returned by
-`eat--t-pin-wide-char'.  Including frame metrics in the key means
-a font size change automatically generates fresh entries without
-manual invalidation.  Lazily initialized in
-`eat--t-pin-wide-char'.")
+  "Nested hash mapping font → (char face char-w . char-h) → pin decision.
+Top-level keys are font objects (as returned by `face-font') with
+weak-key semantics, so fonts no longer referenced by any live frame
+are garbage-collected automatically.  Inner hashes are keyed on
+`(char face char-w . char-h)'; values are `(CELL-FACE . PAD-PX)'
+conses returned by `eat--t-pin-wide-char'.
 
-(defun eat--t-measure-glyph (char face)
-  "Return `(WIDTH . HEIGHT)' in pixels for CHAR rendered with FACE.
+Keying by font avoids unnecessary recomputation when the frame
+metrics change but the actual glyph/fallback chain doesn't; it also
+means a font change (including fallback-font change) naturally
+produces cache misses without needing an explicit invalidation
+hook.  Lazily initialized in `eat--t-font-pin-cache'.")
+
+(defun eat--t-font-pin-cache (font)
+  "Return the inner pin cache for FONT, creating it if needed.
+The top-level cache is a weak-keyed hash, so entries for fonts no
+longer referenced (e.g. after all frames using a font are deleted
+or the user swaps to a different primary font) are
+garbage-collected automatically."
+  (unless eat--t-wide-char-width-cache
+    (setq eat--t-wide-char-width-cache (make-hash-table :test 'eq
+                                                        :weakness 'key)))
+  (or (gethash font eat--t-wide-char-width-cache)
+      (puthash font (make-hash-table :test 'equal)
+               eat--t-wide-char-width-cache)))
+
+(defun eat--t-measure-glyph (window char face)
+  "Return `(WIDTH . HEIGHT)' in pixels for CHAR rendered with FACE in WINDOW.
 Inserts the propertized character plus surrounding newlines into the
 current buffer at `point-max', measures via `window-text-pixel-size'
-on a live window displaying the buffer, and rolls back the insertion.
-Returns nil when the buffer isn't displayed in any window."
-  (let ((win (get-buffer-window (current-buffer) t)))
-    (when win
-      (let ((inhibit-read-only t)
-            (inhibit-modification-hooks t)
-            (buffer-undo-list t))
-        (save-excursion
-          (goto-char (point-max))
-          (let ((start (point)))
-            (unwind-protect
-                (progn
-                  (insert "\n" (propertize (string char) 'face face) "\n")
-                  ;; Measure only the middle line (skip the leading
-                  ;; newline); trailing newline terminates the line
-                  ;; so its height is reported.
-                  (let ((size (window-text-pixel-size
-                               win (1+ start) (point))))
-                    (cons (car size) (cdr size))))
-              (delete-region start (point-max)))))))))
+against WINDOW (so the result reflects that window's frame's font
+metrics), and rolls back the insertion."
+  (let ((inhibit-read-only t)
+        (inhibit-modification-hooks t)
+        (buffer-undo-list t))
+    (save-excursion
+      (goto-char (point-max))
+      (let ((start (point)))
+        (unwind-protect
+            (progn
+              (insert "\n" (propertize (string char) 'face face) "\n")
+              (let ((size (window-text-pixel-size
+                           window (1+ start) (point))))
+                (cons (car size) (cdr size))))
+          (delete-region start (point-max)))))))
 
-(defun eat--t-pin-wide-char (char face width)
-  "Compute display adjustments to pin CHAR to WIDTH cells of space.
-FACE is the base face applied to CHAR.  The returned adjustments
-make CHAR render at no more than `WIDTH * frame-char-width' pixels
-wide and no more than `frame-char-height' pixels tall, so both
-column alignment and line height stay stable even when fallback
-fonts produce oversized glyphs (emoji, CJK).
-
-Returns a cons (CELL-FACE . COMPANION-WIDTH):
+(defun eat--t-pin-wide-char (window char face width)
+  "Compute display adjustments to pin CHAR to WIDTH cells in WINDOW.
+Returns a cons (CELL-FACE . PAD-PX):
 - CELL-FACE is the face to apply to the visible glyph.  Oversized
   glyphs are scaled down via a stacked `(:height SCALE)' face.
-- COMPANION-WIDTH is the pixel width to enforce on the trailing
-  invisible-space companion cell via `display (space :width N)',
-  absorbing any residual gap left by bucket-snapping.
+- PAD-PX is the pixel pad to distribute around the glyph so column
+  alignment is preserved regardless of fallback-font glyph metrics.
 
-Returns nil on non-graphical frames, on Emacs versions without
-`string-pixel-width' (< 29.1), or when the current buffer has no
-live window yet (e.g. during startup, before the terminal has been
-displayed) so it cannot measure reliably; callers fall back to the
-legacy always-invisible companion path."
-  (when (and (display-graphic-p)
-             (fboundp 'string-pixel-width)
-             (get-buffer-window (current-buffer) t))
-    (unless eat--t-wide-char-width-cache
-      (setq eat--t-wide-char-width-cache (make-hash-table :test 'equal)))
-    (let* ((key (list char face (frame-char-width) (frame-char-height)))
-           (cached (gethash key eat--t-wide-char-width-cache)))
+Measurement is against WINDOW's frame's cell metrics, and results are
+cached in the per-frame hash returned by `eat--t-frame-pin-cache'.
+Returns nil if WINDOW is nil or `string-pixel-width' is unavailable."
+  (when (and window (fboundp 'string-pixel-width))
+    (let* ((frame (window-frame window))
+           ;; Use WINDOW's effective cell size rather than FRAME's —
+           ;; so text-scale-increase (buffer-local face-remap) is
+           ;; respected.  Frame metrics ignore face-remaps.
+           (char-w (window-font-width window))
+           (char-h (window-font-height window))
+           ;; Key the cache by the actual font object backing the
+           ;; default face on FRAME.  A font change produces a new
+           ;; object identity and thus a natural cache miss; a mere
+           ;; metric change (e.g. text-scale) on the same font is
+           ;; discriminated by the char-w/char-h suffix below.
+           (font (face-font 'default frame))
+           (cache (eat--t-font-pin-cache font))
+           (key (list char face char-w char-h))
+           (cached (gethash key cache)))
       (or cached
-          (let ((natural (eat--t-measure-glyph char face)))
+          (let ((natural (eat--t-measure-glyph window char face)))
             (when natural
               (let* ((nat-w (car natural))
                      (nat-h (cdr natural))
-                     (target-w (* width (frame-char-width)))
-                     (target-h (frame-char-height))
+                     (target-w (* width char-w))
+                     (target-h char-h)
                      (result
+                      ;; Returns (HEIGHT-FACE-OR-NIL . PAD-PX).
+                      ;; HEIGHT-FACE is either nil (no scaling) or a
+                      ;; bare `(:height SCALE)' plist that composes
+                      ;; with the underlying text-property face,
+                      ;; preserving fg/bg color changes (e.g. SGR
+                      ;; visual-select highlights from the program
+                      ;; running in the terminal).
                       (if (and (<= nat-w target-w)
                                (<= nat-h target-h))
-                          (cons face (- target-w nat-w))
-                        ;; Scale isotropically to fit both dimensions,
-                        ;; then ratchet down for bucket-snap overshoot.
+                          (cons nil (- target-w nat-w))
                         (let* ((scale (min (/ (float target-w) nat-w)
                                            (/ (float target-h) nat-h)))
-                               (scaled-face
-                                (list (list :height scale) face))
+                               (height-face (list :height scale))
+                               (measure-face
+                                (list height-face face))
                                (measured
-                                (eat--t-measure-glyph char scaled-face))
+                                (eat--t-measure-glyph
+                                 window char measure-face))
                                (tries 0))
                           (while (and measured
                                       (or (> (car measured) target-w)
@@ -1972,16 +1992,18 @@ legacy always-invisible companion path."
                                       (> scale 0.1)
                                       (< tries 20))
                             (setq scale (- scale 0.05))
-                            (setq scaled-face
-                                  (list (list :height scale) face))
+                            (setq height-face (list :height scale))
+                            (setq measure-face
+                                  (list height-face face))
                             (setq measured
-                                  (eat--t-measure-glyph char scaled-face))
+                                  (eat--t-measure-glyph
+                                   window char measure-face))
                             (cl-incf tries))
-                          (cons scaled-face
+                          (cons height-face
                                 (if measured
                                     (max 0 (- target-w (car measured)))
                                   0))))))
-                (puthash key result eat--t-wide-char-width-cache))))))))
+                (puthash key result cache))))))))
 
 (defun eat--t-remove-pin-overlays (beg end)
   "Remove all pin overlays between BEG and END."
@@ -1989,89 +2011,176 @@ legacy always-invisible companion path."
     (when (overlay-get ov 'eat--pin)
       (delete-overlay ov))))
 
+(defvar eat-terminal)
+
+(defun eat--t-refresh-pin-overlays ()
+  "Refresh wide-char pin overlays in the current eat buffer.
+Purges overlays in scrollback and re-scans the active display region.
+Shared between the output drain and external triggers (e.g. frame
+resize).  Relies on the scanner's per-overlay cache to skip work when
+nothing has actually changed."
+  (when (and eat-terminal (eat-term-live-p eat-terminal))
+    (eat--t-remove-pin-overlays
+     (point-min) (eat-term-display-beginning eat-terminal))
+    (eat--t-apply-wide-char-pins
+     (eat-term-display-beginning eat-terminal)
+     (eat-term-end eat-terminal))))
+
+;; Register globally once.  Window-configuration changes (buffer
+;; switched into a window, window split, frame created/resized, font
+;; changed) fire this hook; we just forward into the standard refresh
+;; routine.  Pattern mirrors `eat--color-palette-update-check'.
+(add-hook 'window-configuration-change-hook
+          #'eat--on-window-configuration-change)
+
+(defun eat--on-window-configuration-change ()
+  "Refresh pin overlays in every live eat buffer with a visible window.
+The hook is global; we iterate all eat buffers because the firing
+context's `current-buffer' is unreliable for buffer-local dispatch."
+  (dolist (buffer (buffer-list))
+    (when-let* ((terminal (buffer-local-value 'eat-terminal buffer))
+                ((eat-term-live-p terminal))
+                ((get-buffer-window buffer t)))
+      (with-current-buffer buffer
+        (eat--t-refresh-pin-overlays)))))
+
+(defun eat--t-pin-overlay-at (pos window)
+  "Return the `eat--pin' overlay anchored at POS for WINDOW, or nil.
+Pin overlays for the visible glyph at POS always have `overlay-end'
+equal to POS+1; we filter on that to avoid mis-matching the
+*previous* glyph's overlay (whose right edge touches POS) when two
+identical wide chars sit adjacently."
+  (seq-find (lambda (ov)
+              (and (overlay-get ov 'eat--pin)
+                   (eq (overlay-get ov 'window) window)
+                   (= (overlay-end ov) (1+ pos))))
+            (overlays-in pos (1+ pos))))
+
 (defun eat--t-apply-wide-char-pins (beg end)
   "Apply width/height pins to oversized characters between BEG and END.
-Scans the region for visible non-ASCII characters whose fallback-font
-metrics exceed the frame's cell grid.  Each such character is pinned
-via a single overlay carrying:
-- A scaled `face' that constrains glyph height to `frame-char-height'.
-- Matching `before-string' and `after-string' stretch glyphs that
-  center any residual horizontal pad across the cell boundary, so
-  column alignment is preserved pixel-perfect.
+For each live window displaying the current buffer, scans the region
+for non-ASCII visible characters and pins each one via a per-window
+overlay.  The overlay's `window' property restricts its display to
+exactly that window, so multiple frames/windows with different fonts
+each get their own pin.
+
+Reuses existing overlays whose `eat--pin-char' and `eat--pin-metrics'
+match the current glyph and the window-frame's metrics; repeated
+drains on unchanging content do no measurement work.  Overlays for
+chars that have been overwritten or for dead windows are purged at
+the end of the scan.
 
 Width-2+ chars' invisible companion cells remain `invisible t' from
 `eat--t-write'; the overlay spans both the glyph and its companions,
 and the padding bridges the whole cell group.
 
-Measurement is skipped for pure ASCII (< 128) since those always
-render in the primary monospace font.  All pin state lives on the
-overlay; stripping overlays fully undoes a pin.
-
-No-op on non-graphical frames, pre-Emacs-29, or when the current
-buffer has no live window displaying it."
+No-op on non-graphical frames, pre-Emacs-29, or when the buffer is
+not displayed in any live window."
   (when (and (display-graphic-p)
-             (fboundp 'string-pixel-width)
-             (get-buffer-window (current-buffer) t))
+             (fboundp 'string-pixel-width))
     (let* ((inhibit-read-only t)
            (inhibit-modification-hooks t)
            (buffer-undo-list t)
-           (pos beg))
-      ;; Strip stale pin overlays so we start from a clean slate —
-      ;; cells may have been overwritten since the last drain.
-      (eat--t-remove-pin-overlays beg end)
-      (while (and pos (< pos end))
-        (let ((char (char-after pos))
-              (invisible-space (get-text-property
-                                pos 'eat--t-invisible-space)))
-          (when (and char (>= char 128) (not invisible-space))
-            (let* ((char-width (or (get-text-property
-                                    pos 'eat--t-char-width)
-                                   1))
-                   (face (get-text-property pos 'face))
-                   (pin (eat--t-pin-wide-char char face char-width)))
-              (when pin
-                (let* ((cell-face (car pin))
-                       (pad-px (cdr pin))
-                       (scaled (not (eq cell-face face))))
-                  ;; Skip chars that need no adjustment (natural
-                  ;; metrics fit and face is unchanged).  Zero-pad
-                  ;; naturally-fitting chars would still create an
-                  ;; overlay with nothing to do.
-                  (when (or scaled (> pad-px 0))
-                    (let* (;; Split residual pad across both sides so
-                           ;; the glyph sits centered in its cell;
-                           ;; odd pads drop the extra pixel on the
-                           ;; trailing side.
-                           (lead-px (/ pad-px 2))
-                           (trail-px (- pad-px lead-px))
-                           ;; The overlay spans the visible glyph
-                           ;; plus its invisible companion cells
-                           ;; (width 1..N).  Companions sit *before*
-                           ;; the visible glyph in the buffer (see
-                           ;; `eat--t-write'), so the overlay extends
-                           ;; (char-width - 1) chars back.
-                           (ov-start (max beg (- pos (1- char-width))))
-                           (ov-end (1+ pos))
-                           (ov (make-overlay ov-start ov-end)))
-                      (overlay-put ov 'eat--pin t)
-                      ;; Low priority so region, hl-line, isearch, and
-                      ;; other user-visible highlights compose on top
-                      ;; of our scaled face instead of being shadowed.
-                      (overlay-put ov 'priority -100)
-                      (when scaled
-                        (overlay-put ov 'face cell-face))
-                      (when (> lead-px 0)
-                        (overlay-put
-                         ov 'before-string
-                         (propertize
-                          " " 'display `(space :width (,lead-px)))))
-                      (when (> trail-px 0)
-                        (overlay-put
-                         ov 'after-string
-                         (propertize
-                          " " 'display
-                          `(space :width (,trail-px))))))))))))
-        (setq pos (1+ pos))))))
+           (windows (get-buffer-window-list (current-buffer) nil t))
+           ;; Track overlays we kept or created so we can drop any
+           ;; leftovers at the end.
+           (live (make-hash-table :test 'eq)))
+      (dolist (window windows)
+        (let* ((frame (window-frame window))
+               (metrics (cons (frame-char-width frame)
+                              (frame-char-height frame)))
+               (pos beg))
+          (while (and pos (< pos end))
+            (let ((char (char-after pos))
+                  (invisible-space (get-text-property
+                                    pos 'eat--t-invisible-space)))
+              (when (and char (>= char 128) (not invisible-space))
+                (let* ((char-width (or (get-text-property
+                                        pos 'eat--t-char-width)
+                                       1))
+                       (existing (eat--t-pin-overlay-at pos window))
+                       (ov (eat--t-ensure-pin-overlay
+                            pos char char-width existing
+                            window metrics beg)))
+                  (when ov (puthash ov t live)))))
+            (setq pos (1+ pos)))))
+      ;; Purge overlays we didn't touch (chars overwritten, windows
+      ;; closed, or windows no longer showing the buffer).
+      (dolist (ov (overlays-in beg end))
+        (when (and (overlay-get ov 'eat--pin)
+                   (not (gethash ov live)))
+          (delete-overlay ov))))))
+
+(defun eat--t-ensure-pin-overlay (pos char char-width existing
+                                      window metrics beg)
+  "Ensure the correct pin overlay exists at POS for CHAR in WINDOW.
+EXISTING is the overlay currently at POS for WINDOW (or nil).
+METRICS is WINDOW's frame's `(CHAR-W . CHAR-H)' cell size; BEG is
+the lower bound of the scan region (so overlays don't extend into
+scrollback).
+
+The returned overlay carries only a `:height' face (no colors), so
+the underlying text-property face — which may carry SGR-driven fg/bg
+swaps from the program in the terminal (e.g. neovim visual select) —
+composes through cleanly.  Padding strings inherit that same face so
+they highlight along with the glyph.
+
+The cache for shape (height + pad pixels) is keyed on the underlying
+font and metrics, not the dynamic color face, so cache hits remain
+high even as colors flip frame-to-frame.  We always re-derive the
+padding strings' face from the current text-property face on each
+visit so highlight changes propagate without a scale recompute.
+
+Returns the overlay (either the reused EXISTING or a fresh one), or
+nil when no pin is needed and EXISTING was deleted."
+  (let* ((face (get-text-property pos 'face))
+         (cached-shape
+          (and existing
+               (eq (overlay-get existing 'eat--pin-char) char)
+               (equal (overlay-get existing 'eat--pin-metrics) metrics)
+               (overlay-get existing 'eat--pin-shape)))
+         (pin (or cached-shape
+                  (eat--t-pin-wide-char window char face char-width)))
+         (height-face (car-safe pin))
+         (pad-px (or (cdr-safe pin) 0))
+         (needs-overlay (and pin (or height-face (> pad-px 0)))))
+    (cond
+     ((not needs-overlay)
+      (when existing (delete-overlay existing))
+      nil)
+     (t
+      (let* ((lead-px (/ pad-px 2))
+             (trail-px (- pad-px lead-px))
+             (ov-start (max beg (- pos (1- char-width))))
+             (ov-end (1+ pos))
+             (ov (if cached-shape
+                     existing
+                   (when existing (delete-overlay existing))
+                   (make-overlay ov-start ov-end))))
+        (overlay-put ov 'eat--pin t)
+        (overlay-put ov 'eat--pin-char char)
+        (overlay-put ov 'eat--pin-metrics metrics)
+        (overlay-put ov 'eat--pin-shape pin)
+        (overlay-put ov 'window window)
+        (overlay-put ov 'priority -100)
+        (overlay-put ov 'face height-face)
+        ;; Re-build padding strings from the *current* text-property
+        ;; face every visit so SGR-driven highlight changes (visual
+        ;; select, etc.) extend across residual pixels.  Cheap; the
+        ;; expensive measurement is still cached above.
+        (overlay-put ov 'before-string
+                     (and (> lead-px 0)
+                          (propertize
+                           " "
+                           'face face
+                           'display `(space :width (,lead-px)))))
+        (overlay-put ov 'after-string
+                     (and (> trail-px 0)
+                          (propertize
+                           " "
+                           'face face
+                           'display `(space :width (,trail-px)))))
+        ov)))))
 
 (defun eat--t-write (str &optional beg end)
   "Write STR from BEG to END on display."
@@ -7808,9 +7917,7 @@ established any buffer-level protections it needs
              `( read-only t field eat-terminal
                 ,@(when eat--line-mode
                     '(front-sticky t rear-nonsticky t))))
-            (eat--t-apply-wide-char-pins
-             (eat-term-display-beginning eat-terminal)
-             (eat-term-end eat-terminal))))
+            (eat--t-refresh-pin-overlays)))
         (eat--line-mode-do-toggles)
         (funcall eat--synchronize-scroll-function sync-windows))
       (run-hooks 'eat-update-hook))))
