@@ -4902,7 +4902,13 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
           (unless (bobp)
             (backward-char))
           (while (not (eobp))
-            (eat--t-join-long-line)))))
+            (eat--t-join-long-line))))
+      ;; Drop pin overlays — the buffer is inert content now and
+      ;; mirroring eat's soft-wrap newline removal keeps the post-
+      ;; mortem buffer free of live-only adornments.
+      (eat--t-remove-pin-overlays
+       (eat--t-term-begin eat--t-term)
+       (eat--t-term-end eat--t-term)))
     (setf (eat--t-term-buffer eat--t-term) nil)))
 
 (defun eat-term-reset (terminal)
@@ -8551,6 +8557,7 @@ advances eshell's output markers and the output process's
           (when-let* ((proc (eat-term-parameter
                              eat-terminal 'eat--output-process)))
             (set-marker (process-mark proc) end)))
+        (eat--t-refresh-pin-overlays)
         (funcall eat--synchronize-scroll-function sync-windows))
       (run-hooks 'eat-eshell-update-hook))))
 
