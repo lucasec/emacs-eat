@@ -4022,11 +4022,11 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
                   (cl-incf action-count))
                  ;; CSI <n> E.
                  (`((?E) nil ((,n)))
-                  (push (vector 'beg-of-prev-line n) actions)
+                  (push (vector 'beg-of-next-line n) actions)
                   (cl-incf action-count))
                  ;; CSI <n> F.
                  (`((?F) nil ((,n)))
-                  (push (vector 'beg-of-next-line n) actions)
+                  (push (vector 'beg-of-prev-line n) actions)
                   (cl-incf action-count))
                  ;; CSI <n> G.
                  ;; CSI <n> `.
