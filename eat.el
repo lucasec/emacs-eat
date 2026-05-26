@@ -5525,10 +5525,7 @@ return \"eat-color\", otherwise return \"eat-mono\"."
                                 (caddr eat--cursor-blink-type)
                               (car eat--cursor-blink-type)))
     (setq eat--cursor-blink-state (not eat--cursor-blink-state))
-    ;; REVIEW: This is expensive, and some causes flickering.  Any
-    ;; better way?
-    (when-let* ((window (get-buffer-window nil 'visible)))
-      (redraw-frame (window-frame window)))))
+    (force-window-update (current-buffer))))
 
 (defun eat--cursor-blink-stop-timers ()
   "Stop blinking timers."
