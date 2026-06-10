@@ -2026,12 +2026,20 @@ nothing has actually changed."
      (eat-term-display-beginning eat-terminal)
      (eat-term-end eat-terminal))))
 
-;; Register globally once.  Window-configuration changes (buffer
-;; switched into a window, window split, frame created/resized, font
-;; changed) fire this hook; we just forward into the standard refresh
-;; routine.  Pattern mirrors `eat--color-palette-update-check'.
+;; When an Eat buffer is displayed in a new window or that window is
+;; resized due to a font configuration change, we need to compute new
+;; unicode pin overlays. Overlays are stored buffer-locally as each
+;; window could use a different font, text scale, etc.
 (add-hook 'window-configuration-change-hook
           #'eat--on-window-configuration-change)
+
+;; Track the selected window as well as what buffer is being displayed
+;; within it for focus tracking.
+(add-hook 'window-state-change-hook #'eat--on-window-state-change)
+
+;; Track when frame that may be displaying Eat buffers gain or lose
+;; focus in the OS/window manager for focus tracking.
+(add-function :after after-focus-change-function #'eat--on-focus-change)
 
 (defun eat--on-window-configuration-change ()
   "Refresh pin overlays in every live eat buffer with a visible window.
@@ -2043,6 +2051,17 @@ context's `current-buffer' is unreliable for buffer-local dispatch."
                 ((get-buffer-window buffer t)))
       (with-current-buffer buffer
         (eat--t-refresh-pin-overlays)))))
+
+(defun eat--on-window-state-change ()
+  "Update focus state for every live eat buffer.
+This scans every buffer, identifies buffers with an Eat terminal, then
+checks all windows displaying the buffer to decide whether it gained or
+lost focus and report an accurate focus event to the terminal."
+  (dolist (buffer (buffer-list))
+    (when-let* ((terminal (buffer-local-value 'eat-terminal buffer))
+                ((eat-term-live-p terminal)))
+      (with-current-buffer buffer
+        (eat--update-buffer-focus-state buffer)))))
 
 (defun eat--t-pin-overlay-at (pos window)
   "Return the `eat--pin' overlay anchored at POS for WINDOW, or nil.
@@ -5884,6 +5903,11 @@ return \"eat-color\", otherwise return \"eat-mono\"."
 (defvar eat-terminal nil
   "The terminal emulator.")
 
+(defvar eat--focus-state 'unknown
+  "The focus state reported to the terminal application.
+t if focus-in was reported, nil if focus-out was reported, or `unknown'
+if no event has been reported yet.")
+
 (defvar eat--synchronize-scroll-function nil
   "Function to synchronize scrolling between terminal and window.")
 
@@ -5909,6 +5933,57 @@ return \"eat-color\", otherwise return \"eat-mono\"."
   "Automatic line mode toggles left to do.
 
 Don't change the toplevel value of this, let-bind instead.")
+
+(defun eat--focus-p (buffer)
+  "Return non-nil if eat BUFFER should be considered focused.
+BUFFER is considered focused if its window is the selected window in at
+least one Emacs frame that has focus in the OS/window manager."
+  (catch 'focused
+    (dolist (win (get-buffer-window-list buffer nil t))
+      (let ((frame (window-frame win)))
+        (when (and (eq win (frame-selected-window frame))
+                   ;; `frame-focus-state' returns t, nil, or
+                   ;; `unknown'; treat anything but explicit nil as
+                   ;; focused so ttys default to focused.
+                   (not (eq (frame-focus-state frame) nil)))
+          (throw 'focused t))))
+    nil))
+
+(defun eat--update-buffer-focus-state (buffer)
+  "Recompute BUFFER's focus and emit a transition event if it changed.
+BUFFER must be a live eat buffer and the current buffer."
+  (let ((focused (and (eat--focus-p buffer) t)))
+    (unless (eq focused eat--focus-state)
+      (setq eat--focus-state focused)
+      ;; eat-term-input-event drops the event if focus reporting has
+      ;; not been enabled by the terminal application.
+      (eat-term-input-event
+       eat-terminal 1
+       (if focused '(eat-focus-in) '(eat-focus-out))))))
+
+(defvar eat--focus-change-timer nil
+  "Timer coalescing a burst of `after-focus-change-function' calls.")
+
+(defun eat--on-focus-change ()
+  "Handler for `after-focus-change-function'.
+This reports if the user has switched focus away from the Emacs frame
+entirely in their OS/window manager, allowing us to pass that
+information to terminal applications.
+
+Per the elisp manual, defer handling until the next display as some
+operating systems send flapping or duplicate focus events."
+  (unless eat--focus-change-timer
+    (setq eat--focus-change-timer
+          (run-with-idle-timer 0 nil #'eat--apply-focus-change))))
+
+(defun eat--apply-focus-change ()
+  "Update focus state for all live eat buffers after focus events settle."
+  (setq eat--focus-change-timer nil)
+  (dolist (buffer (buffer-list))
+    (when-let* ((terminal (buffer-local-value 'eat-terminal buffer))
+                ((eat-term-live-p terminal)))
+      (with-current-buffer buffer
+        (eat--update-buffer-focus-state buffer)))))
 
 (defun eat-reset ()
   "Perform a terminal reset."
@@ -7669,7 +7744,8 @@ to all terminals with mode 2031 enabled."
           eat--process-output-queue-timer
           eat--shell-prompt-annotation-correction-timer
           eat--synchronized-output-timer
-          eat--color-palette-update-bg-mode))
+          eat--color-palette-update-bg-mode
+          eat--focus-statCane))
   ;; This is intended; input methods don't work on read-only buffers.
   (setq buffer-read-only nil)
   (setq scroll-margin 0)
@@ -8742,7 +8818,8 @@ symbol `buffer', in which case the point of current buffer is set."
                   eat--output-queue-first-chunk-time
                   eat--process-output-queue-timer
                   eat--eshell-invocation-directory
-                  eat--color-palette-update-bg-mode)))
+                  eat--color-palette-update-bg-mode
+                  eat--focus-state)))
     (cond
      (eat--eshell-local-mode
       (mapc #'make-local-variable locals)
