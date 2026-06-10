@@ -4289,193 +4289,194 @@ If NULLIFY is non-nil, nullify flushed part of Sixel buffer."
               ((= index (length output))
                (setf (eat--t-term-parser-state eat--t-term)
                      `(read-csi-function ,format ,params ,function))
-               (setq loop nil)))
-             (push (aref output index) function)
-             (cl-incf index)
-             (when (<= ?@ (car function) ?~)
-               ;; Now we have enough information to execute it!
-               (setq loop nil)
-               (setf (eat--t-term-parser-state eat--t-term) nil)
-               ;; NOTE: `function' and `params' are in reverse order!
-               (pcase (list function format params)
-                 ;; CSI <n> @.
-                 (`((?@) nil ((,n)))
-                  (push (vector 'insert-char n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> A.
-                 ;; CSI <n> k.
-                 (`((,(or ?A ?k)) nil ((,n)))
-                  (push (vector 'cur-up n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> B.
-                 ;; CSI <n> e.
-                 (`((,(or ?B ?e)) nil ((,n)))
-                  (push (vector 'cur-down n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> C.
-                 ;; CSI <n> a.
-                 (`((,(or ?C ?a)) nil ((,n)))
-                  (push (vector 'cur-right n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> D.
-                 ;; CSI <n> j.
-                 (`((,(or ?D ?j)) nil ((,n)))
-                  (push (vector 'cur-left n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> E.
-                 (`((?E) nil ((,n)))
-                  (push (vector 'beg-of-next-line n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> F.
-                 (`((?F) nil ((,n)))
-                  (push (vector 'beg-of-prev-line n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> G.
-                 ;; CSI <n> `.
-                 (`((,(or ?G ?`)) nil ((,n)))
-                  (push (vector 'cur-horizontal-abs n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> ; <m> H
-                 ;; CSI <n> ; <m> f
-                 (`((,(or ?H ?f)) nil ,(and (pred listp) params))
-                  (push (vector 'goto (caadr params) (caar params)) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> I.
-                 (`((?I) nil ((,n)))
-                  (push (vector 'horizontal-tab n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> J.
-                 (`((?J) nil ((,n)))
-                  (push (vector 'erase-in-disp n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> K.
-                 (`((?K) nil ((,n)))
-                  (push (vector 'erase-in-line n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> L.
-                 (`((?L) nil ((,n)))
-                  (push (vector 'insert-line n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> M.
-                 (`((?M) nil ((,n)))
-                  (push (vector 'delete-line n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> P.
-                 (`((?P) nil ((,n)))
-                  (push (vector 'delete-char n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> S.
-                 (`((?S) nil ((,n)))
-                  (push (vector 'scroll-up n) actions)
-                  (cl-incf action-count))
-                 ;; CSI ? <n> ; <m> ; ... S.
-                 (`((?S) ?? ,(or `((,_) (,operation) (,attr))
-                                 `((,_) (,_) (,operation) (,attr))))
-                  (push (vector 'send-graphics-attrs attr operation) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> T.
-                 (`((?T) nil ((,n)))
-                  (push (vector 'scroll-down n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> X.
-                 (`((?X) nil ((,n)))
-                  (push (vector 'erase-char n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> Z.
-                 (`((?Z) nil ((,n)))
-                  (push (vector 'horizontal-backtab n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> b.
-                 (`((?b) nil ((,n)))
-                  (push (vector 'repeat-last-char n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> c.
-                 ;; CSI > <n> c.
-                 (`((?c) ,format ((,n)))
-                  (push (vector 'send-device-attrs n format) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> d.
-                 (`((?d) nil ((,n)))
-                  (push (vector 'cur-vertical-abs n) actions)
-                  (cl-incf action-count))
-                 ;; CSI ... h.
-                 ;; CSI ? ... h.
-                 (`((?h) ,format ,(and (pred listp) params))
-                  ;; Reverse `params' to get it into the correct
-                  ;; order.
-                  (setq params (nreverse params))
-                  (let ((p params))
-                    (while p
-                      (setf (car p) (nreverse (car p)))
-                      (setq p (cdr p))))
-                  ;; Handle mode 2026 (synchronized output)
-                  ;; directly during parsing.
-                  (when (and (eq format ??)
-                             (member '(2026) params))
-                    (eat--t-enable-synchronized-output action-count)
-                    (setq params (delete '(2026) params)))
-                  (when params
-                    (push (vector 'set-modes params format) actions)
-                    (cl-incf action-count)))
-                 ;; CSI ... l.
-                 ;; CSI ? ... l.
-                 (`((?l) ,format ,(and (pred listp) params))
-                  ;; Reverse `params' to get it into the correct
-                  ;; order.
-                  (setq params (nreverse params))
-                  (let ((p params))
-                    (while p
-                      (setf (car p) (nreverse (car p)))
-                      (setq p (cdr p))))
-                  ;; Handle mode 2026 (synchronized output)
-                  ;; directly during parsing.
-                  (when (and (eq format ??)
-                             (member '(2026) params))
-                    (eat--t-disable-synchronized-output action-count)
-                    (setq params (delete '(2026) params)))
-                  (when params
-                    (push (vector 'reset-modes params format) actions)
-                    (cl-incf action-count)))
-                 ;; CSI ... m.
-                 (`((?m) nil ,(and (pred listp) params))
-                  ;; Reverse `params' to get it into the correct
-                  ;; order.
-                  (setq params (nreverse params))
-                  (let ((p params))
-                    (while p
-                      (setf (car p) (nreverse (car p)))
-                      (setq p (cdr p))))
-                  (push (vector 'set-sgr-params params) actions)
-                  (cl-incf action-count))
-                 ;; CSI 6 n.
-                 (`((?n) nil ((,n)))
-                  (push (vector 'device-status-report n) actions)
-                  (cl-incf action-count))
-                 ;; CSI ? <n> n.
-                 (`((?n) ?? ((,n)))
-                  (push (vector 'private-device-status-report n) actions)
-                  (cl-incf action-count))
-                 ;; CSI ? <n> $ p (DECRQM - Request Mode).
-                 (`((?p ?$) ?? ((,n)))
-                  (push (vector 'request-private-mode n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> SP q.
-                 (`((?q ?\ ) nil ((,n)))
-                  (push (vector 'set-cursor-style n) actions)
-                  (cl-incf action-count))
-                 ;; CSI <n> ; <n> r.
-                 (`((?r) nil ,(and (pred listp) params))
-                  (push (vector 'change-scroll-region (caadr params)
-                                (caar params)) actions)
-                  (cl-incf action-count))
-                 ;; CSI s.
-                 (`((?s) nil nil)
-                  (push (vector 'save-cur) actions)
-                  (cl-incf action-count))
-                 ;; CSI u.
-                 (`((?u) nil nil)
-                  (push (vector 'restore-cur) actions)
-                  (cl-incf action-count)))))))
+               (setq loop nil))
+              (t
+               (push (aref output index) function)
+               (cl-incf index)
+               (when (<= ?@ (car function) ?~)
+                 ;; Now we have enough information to execute it!
+                 (setq loop nil)
+                 (setf (eat--t-term-parser-state eat--t-term) nil)
+                 ;; NOTE: `function' and `params' are in reverse order!
+                 (pcase (list function format params)
+                   ;; CSI <n> @.
+                   (`((?@) nil ((,n)))
+                    (push (vector 'insert-char n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> A.
+                   ;; CSI <n> k.
+                   (`((,(or ?A ?k)) nil ((,n)))
+                    (push (vector 'cur-up n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> B.
+                   ;; CSI <n> e.
+                   (`((,(or ?B ?e)) nil ((,n)))
+                    (push (vector 'cur-down n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> C.
+                   ;; CSI <n> a.
+                   (`((,(or ?C ?a)) nil ((,n)))
+                    (push (vector 'cur-right n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> D.
+                   ;; CSI <n> j.
+                   (`((,(or ?D ?j)) nil ((,n)))
+                    (push (vector 'cur-left n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> E.
+                   (`((?E) nil ((,n)))
+                    (push (vector 'beg-of-next-line n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> F.
+                   (`((?F) nil ((,n)))
+                    (push (vector 'beg-of-prev-line n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> G.
+                   ;; CSI <n> `.
+                   (`((,(or ?G ?`)) nil ((,n)))
+                    (push (vector 'cur-horizontal-abs n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> ; <m> H
+                   ;; CSI <n> ; <m> f
+                   (`((,(or ?H ?f)) nil ,(and (pred listp) params))
+                    (push (vector 'goto (caadr params) (caar params)) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> I.
+                   (`((?I) nil ((,n)))
+                    (push (vector 'horizontal-tab n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> J.
+                   (`((?J) nil ((,n)))
+                    (push (vector 'erase-in-disp n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> K.
+                   (`((?K) nil ((,n)))
+                    (push (vector 'erase-in-line n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> L.
+                   (`((?L) nil ((,n)))
+                    (push (vector 'insert-line n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> M.
+                   (`((?M) nil ((,n)))
+                    (push (vector 'delete-line n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> P.
+                   (`((?P) nil ((,n)))
+                    (push (vector 'delete-char n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> S.
+                   (`((?S) nil ((,n)))
+                    (push (vector 'scroll-up n) actions)
+                    (cl-incf action-count))
+                   ;; CSI ? <n> ; <m> ; ... S.
+                   (`((?S) ?? ,(or `((,_) (,operation) (,attr))
+                                   `((,_) (,_) (,operation) (,attr))))
+                    (push (vector 'send-graphics-attrs attr operation) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> T.
+                   (`((?T) nil ((,n)))
+                    (push (vector 'scroll-down n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> X.
+                   (`((?X) nil ((,n)))
+                    (push (vector 'erase-char n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> Z.
+                   (`((?Z) nil ((,n)))
+                    (push (vector 'horizontal-backtab n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> b.
+                   (`((?b) nil ((,n)))
+                    (push (vector 'repeat-last-char n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> c.
+                   ;; CSI > <n> c.
+                   (`((?c) ,format ((,n)))
+                    (push (vector 'send-device-attrs n format) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> d.
+                   (`((?d) nil ((,n)))
+                    (push (vector 'cur-vertical-abs n) actions)
+                    (cl-incf action-count))
+                   ;; CSI ... h.
+                   ;; CSI ? ... h.
+                   (`((?h) ,format ,(and (pred listp) params))
+                    ;; Reverse `params' to get it into the correct
+                    ;; order.
+                    (setq params (nreverse params))
+                    (let ((p params))
+                      (while p
+                        (setf (car p) (nreverse (car p)))
+                        (setq p (cdr p))))
+                    ;; Handle mode 2026 (synchronized output)
+                    ;; directly during parsing.
+                    (when (and (eq format ??)
+                               (member '(2026) params))
+                      (eat--t-enable-synchronized-output action-count)
+                      (setq params (delete '(2026) params)))
+                    (when params
+                      (push (vector 'set-modes params format) actions)
+                      (cl-incf action-count)))
+                   ;; CSI ... l.
+                   ;; CSI ? ... l.
+                   (`((?l) ,format ,(and (pred listp) params))
+                    ;; Reverse `params' to get it into the correct
+                    ;; order.
+                    (setq params (nreverse params))
+                    (let ((p params))
+                      (while p
+                        (setf (car p) (nreverse (car p)))
+                        (setq p (cdr p))))
+                    ;; Handle mode 2026 (synchronized output)
+                    ;; directly during parsing.
+                    (when (and (eq format ??)
+                               (member '(2026) params))
+                      (eat--t-disable-synchronized-output action-count)
+                      (setq params (delete '(2026) params)))
+                    (when params
+                      (push (vector 'reset-modes params format) actions)
+                      (cl-incf action-count)))
+                   ;; CSI ... m.
+                   (`((?m) nil ,(and (pred listp) params))
+                    ;; Reverse `params' to get it into the correct
+                    ;; order.
+                    (setq params (nreverse params))
+                    (let ((p params))
+                      (while p
+                        (setf (car p) (nreverse (car p)))
+                        (setq p (cdr p))))
+                    (push (vector 'set-sgr-params params) actions)
+                    (cl-incf action-count))
+                   ;; CSI 6 n.
+                   (`((?n) nil ((,n)))
+                    (push (vector 'device-status-report n) actions)
+                    (cl-incf action-count))
+                   ;; CSI ? <n> n.
+                   (`((?n) ?? ((,n)))
+                    (push (vector 'private-device-status-report n) actions)
+                    (cl-incf action-count))
+                   ;; CSI ? <n> $ p (DECRQM - Request Mode).
+                   (`((?p ?$) ?? ((,n)))
+                    (push (vector 'request-private-mode n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> SP q.
+                   (`((?q ?\ ) nil ((,n)))
+                    (push (vector 'set-cursor-style n) actions)
+                    (cl-incf action-count))
+                   ;; CSI <n> ; <n> r.
+                   (`((?r) nil ,(and (pred listp) params))
+                    (push (vector 'change-scroll-region (caadr params)
+                                  (caar params)) actions)
+                    (cl-incf action-count))
+                   ;; CSI s.
+                   (`((?s) nil nil)
+                    (push (vector 'save-cur) actions)
+                    (cl-incf action-count))
+                   ;; CSI u.
+                   (`((?u) nil nil)
+                    (push (vector 'restore-cur) actions)
+                    (cl-incf action-count)))))))))
         (`(,(and (or 'read-sos 'read-osc 'read-pm 'read-apc) state)
            ,buf)
          ;; Find the end of string.
